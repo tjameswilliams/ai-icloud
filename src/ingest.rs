@@ -194,6 +194,7 @@ fn ingest_one(
         file.mtime_ms,
         &sha,
         extracted.title.as_deref(),
+        Some(extracted.pages.len() as i64),
         &pieces,
         now_ms,
     )?;

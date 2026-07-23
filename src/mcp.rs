@@ -206,14 +206,10 @@ impl McpServer {
         if let Some(s) = &doc.summary {
             out.push_str(&format!("summary: {s}\n"));
         }
-        let facts = self.index.search_facts(None, None, None, 200)?;
-        let doc_facts: Vec<_> = facts
-            .iter()
-            .filter(|f| f.document_id == doc.document_id)
-            .collect();
+        let doc_facts = self.index.facts_for_document(doc.document_id)?;
         if !doc_facts.is_empty() {
             out.push_str("facts:\n");
-            for f in doc_facts {
+            for f in &doc_facts {
                 out.push_str(&format!("  {} = {} [{}]\n", f.key, f.value, f.kind));
             }
         }
@@ -692,6 +688,7 @@ mod tests {
             1000,
             "sha1",
             Some("closing"),
+            Some(2),
             &[
                 piece(0, "Sale price of property 487500 dollars"),
                 piece(1, "Net proceeds to seller 250000 dollars"),
@@ -706,6 +703,7 @@ mod tests {
             1000,
             "sha2",
             Some("notes"),
+            Some(1),
             &[piece(0, "buy milk and coffee")],
             2000,
         )

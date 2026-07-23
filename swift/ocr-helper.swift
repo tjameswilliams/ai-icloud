@@ -8,6 +8,10 @@
 //   pdf-text <path>                      — text layer of every page
 //   ocr-pdf <path> <pages-csv> <dpi>     — render + OCR selected pages
 //   ocr-image <path>                     — OCR one image (png/jpg/heic)
+//   render-pdf <path> <pages-csv> <dpi>  — render pages to base64 PNGs
+//   render-image <path>                  — re-encode an image (any format
+//                                          CGImageSource reads, incl. HEIC)
+//                                          as a base64 PNG, downscaled
 
 import AppKit
 import Foundation
@@ -37,6 +41,51 @@ struct OcrPage: Codable {
 
 struct OcrReply: Codable {
     let pages: [OcrPage]
+}
+
+struct RenderPage: Codable {
+    let index: Int
+    let pngBase64: String
+}
+
+struct RenderReply: Codable {
+    let pages: [RenderPage]
+}
+
+func pngBase64(_ image: CGImage) -> String {
+    let rep = NSBitmapImageRep(cgImage: image)
+    guard let data = rep.representation(using: .png, properties: [:]) else {
+        die("could not encode PNG")
+    }
+    return data.base64EncodedString()
+}
+
+/// Downscale so the longest edge is at most `maxEdge` (vision models don't
+/// need print resolution, and request bodies stay small).
+func downscale(_ image: CGImage, maxEdge: Int) -> CGImage {
+    let w = image.width
+    let h = image.height
+    let longest = max(w, h)
+    if longest <= maxEdge {
+        return image
+    }
+    let scale = Double(maxEdge) / Double(longest)
+    let nw = Int(Double(w) * scale)
+    let nh = Int(Double(h) * scale)
+    guard
+        let ctx = CGContext(
+            data: nil, width: nw, height: nh, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else {
+        die("could not create a drawing context")
+    }
+    ctx.interpolationQuality = .high
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: nw, height: nh))
+    guard let scaled = ctx.makeImage() else {
+        die("could not downscale image")
+    }
+    return scaled
 }
 
 func die(_ message: String) -> Never {
@@ -132,6 +181,33 @@ case "ocr-pdf":
         pages.append(OcrPage(index: i, text: text, confidence: confidence))
     }
     emit(OcrReply(pages: pages))
+
+case "render-pdf":
+    guard args.count == 5 else { die("usage: ocr-helper render-pdf <path> <pages-csv> <dpi>") }
+    let doc = openPdf(args[2])
+    let indices = args[3].split(separator: ",").compactMap { Int($0) }
+    guard let dpi = Double(args[4]), dpi >= 36, dpi <= 600 else {
+        die("dpi must be between 36 and 600")
+    }
+    var pages: [RenderPage] = []
+    for i in indices {
+        // Out-of-range renders are skipped, not fatal: callers may only
+        // know an approximate page count.
+        guard i >= 0, i < doc.pageCount, let page = doc.page(at: i) else { continue }
+        let rendered = downscale(renderPage(page, dpi: dpi), maxEdge: 1568)
+        pages.append(RenderPage(index: i, pngBase64: pngBase64(rendered)))
+    }
+    emit(RenderReply(pages: pages))
+
+case "render-image":
+    guard args.count == 3 else { die("usage: ocr-helper render-image <path>") }
+    guard let image = NSImage(contentsOfFile: args[2]),
+        let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    else {
+        die("could not load image \(args[2])")
+    }
+    let rendered = downscale(cg, maxEdge: 1568)
+    emit(RenderReply(pages: [RenderPage(index: 0, pngBase64: pngBase64(rendered))]))
 
 case "ocr-image":
     guard args.count == 3 else { die("usage: ocr-helper ocr-image <path>") }

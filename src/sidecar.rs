@@ -44,6 +44,18 @@ pub struct OcrReply {
     pub pages: Vec<OcrPage>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderPage {
+    pub index: usize,
+    pub png_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenderReply {
+    pub pages: Vec<RenderPage>,
+}
+
 #[derive(Debug)]
 pub struct Sidecar {
     bin: PathBuf,
@@ -111,6 +123,36 @@ impl Sidecar {
             &dpi.to_string(),
         ])?;
         Ok(reply.pages)
+    }
+
+    /// Render (0-based) PDF pages to downscaled base64 PNGs for the
+    /// vision model.
+    pub fn render_pdf(&self, path: &Path, pages: &[usize], dpi: u32) -> Result<Vec<RenderPage>> {
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let csv = pages
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let reply: RenderReply = self.run(&[
+            "render-pdf",
+            &path.to_string_lossy(),
+            &csv,
+            &dpi.to_string(),
+        ])?;
+        Ok(reply.pages)
+    }
+
+    /// Re-encode any readable image (incl. HEIC) as a downscaled base64
+    /// PNG for the vision model.
+    pub fn render_image(&self, path: &Path) -> Result<RenderPage> {
+        let mut reply: RenderReply = self.run(&["render-image", &path.to_string_lossy()])?;
+        reply
+            .pages
+            .pop()
+            .context("sidecar returned no rendered image")
     }
 
     /// OCR a standalone image (png/jpg/heic).

@@ -45,6 +45,19 @@ enum Command {
         /// Skip the embedding pass (chunks index for keyword search only)
         #[arg(long)]
         no_embed: bool,
+        /// Skip the LLM enrichment pass
+        #[arg(long)]
+        no_enrich: bool,
+    },
+    /// Run LLM enrichment (summary, doc_type, facts, tags) on indexed
+    /// documents that lack it
+    Enrich {
+        /// Re-enrich documents that already have an enrichment pass
+        #[arg(long)]
+        force: bool,
+        /// Only process this many documents
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Search the index
     Search {
@@ -91,7 +104,12 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::Doctor => run_doctor(&loaded),
-        Command::Scan { dry_run, no_embed } => run_scan(&loaded, dry_run, no_embed),
+        Command::Scan {
+            dry_run,
+            no_embed,
+            no_enrich,
+        } => run_scan(&loaded, dry_run, no_embed, no_enrich),
+        Command::Enrich { force, limit } => run_enrich(&loaded, force, limit),
         Command::Search {
             query,
             limit,
@@ -211,7 +229,7 @@ fn run_doctor(loaded: &LoadedConfig) -> Result<()> {
     }
 }
 
-fn run_scan(loaded: &LoadedConfig, dry_run: bool, no_embed: bool) -> Result<()> {
+fn run_scan(loaded: &LoadedConfig, dry_run: bool, no_embed: bool, no_enrich: bool) -> Result<()> {
     let config = &loaded.config;
     let root = config.source_root()?;
     let scanned = scan::scan_tree(&root, &config.source)?;
@@ -245,6 +263,16 @@ fn run_scan(loaded: &LoadedConfig, dry_run: bool, no_embed: bool) -> Result<()> 
     let mut report = ingest::ingest(&mut db, config, plan, chrono::Utc::now().timestamp_millis());
     report.pruned_embeddings = db.prune_orphan_embeddings()?;
 
+    // Enrichment runs before embedding so summary chunks get vectors in
+    // the same pass; its failure never fails the scan.
+    if !no_enrich {
+        match crate::enrich::enrich_pending(&mut db, config, false, u32::MAX) {
+            Ok(er) if er.enriched + er.failed > 0 => println!("enrichment: {}", er.summary()),
+            Ok(_) => {}
+            Err(err) => tracing::warn!("enrichment pass skipped: {err:#}"),
+        }
+    }
+
     if !no_embed {
         let model_dir = config.index_dir()?.join("models");
         let mut embedder = embed::make_embedder(config, &model_dir)?;
@@ -252,6 +280,23 @@ fn run_scan(loaded: &LoadedConfig, dry_run: bool, no_embed: bool) -> Result<()> 
     }
     db.set_last_scan_ms(chrono::Utc::now().timestamp_millis())?;
     println!("{}", report.summary());
+    Ok(())
+}
+
+fn run_enrich(loaded: &LoadedConfig, force: bool, limit: Option<u32>) -> Result<()> {
+    let config = &loaded.config;
+    let db_path = config.index_db_path()?;
+    if !db_path.exists() {
+        bail!("no index yet — run `ai-icloud scan` first");
+    }
+    let mut db = IndexDb::open(&db_path)?;
+    let report = crate::enrich::enrich_pending(&mut db, config, force, limit.unwrap_or(u32::MAX))?;
+
+    // Summary chunks need vectors to join semantic search.
+    let model_dir = config.index_dir()?.join("models");
+    let mut embedder = embed::make_embedder(config, &model_dir)?;
+    let embedded = ingest::embed_missing(&mut db, embedder.as_mut())?;
+    println!("{}, {embedded} summary chunk(s) embedded", report.summary());
     Ok(())
 }
 

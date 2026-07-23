@@ -172,10 +172,22 @@ pub struct DocumentInfo {
     pub title: Option<String>,
     pub doc_type: Option<String>,
     pub summary: Option<String>,
+    pub page_count: Option<i64>,
     pub size: i64,
     pub mtime_ms: i64,
     pub indexed_at_ms: Option<i64>,
     pub chunk_count: i64,
+    pub tags: Vec<String>,
+}
+
+/// Enrichment output ready to store (see `apply_enrichment`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrichmentRecord {
+    pub title: Option<String>,
+    pub doc_type: String,
+    pub summary: String,
+    /// (key, value, kind, page)
+    pub facts: Vec<(String, String, String, Option<i64>)>,
     pub tags: Vec<String>,
 }
 
@@ -411,6 +423,7 @@ impl IndexDb {
         mtime_ms: i64,
         content_sha256: &str,
         title: Option<&str>,
+        page_count: Option<i64>,
         chunks: &[ChunkPiece],
         indexed_at_ms: i64,
     ) -> Result<(), IndexError> {
@@ -431,8 +444,8 @@ impl IndexDb {
             |r| r.get(0),
         )?;
         tx.execute(
-            "INSERT INTO documents (file_id, title) VALUES (?1, ?2)",
-            params![file_id, title],
+            "INSERT INTO documents (file_id, title, page_count) VALUES (?1, ?2, ?3)",
+            params![file_id, title, page_count],
         )?;
         let document_id = tx.last_insert_rowid();
         {
@@ -641,7 +654,7 @@ impl IndexDb {
     // ---------------------------------------------------------- documents
 
     const DOCUMENT_SELECT: &'static str = "
-        SELECT d.id, f.rel_path, f.kind, d.title, d.doc_type, d.summary,
+        SELECT d.id, f.rel_path, f.kind, d.title, d.doc_type, d.summary, d.page_count,
                f.size, f.mtime_ms, f.indexed_at_ms,
                (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id)
         FROM documents d JOIN files f ON f.id = d.file_id";
@@ -654,10 +667,11 @@ impl IndexDb {
             title: row.get(3)?,
             doc_type: row.get(4)?,
             summary: row.get(5)?,
-            size: row.get(6)?,
-            mtime_ms: row.get(7)?,
-            indexed_at_ms: row.get(8)?,
-            chunk_count: row.get(9)?,
+            page_count: row.get(6)?,
+            size: row.get(7)?,
+            mtime_ms: row.get(8)?,
+            indexed_at_ms: row.get(9)?,
+            chunk_count: row.get(10)?,
             tags: Vec::new(),
         })
     }
@@ -830,6 +844,125 @@ impl IndexDb {
         Ok(rows)
     }
 
+    /// Documents that still need (or, with `force`, should redo) an
+    /// enrichment pass. Only successfully indexed files qualify.
+    pub fn documents_needing_enrichment(
+        &self,
+        force: bool,
+        limit: u32,
+    ) -> Result<Vec<DocumentInfo>, IndexError> {
+        let mut sql = format!("{} WHERE f.status = 'indexed'", Self::DOCUMENT_SELECT);
+        if !force {
+            sql.push_str(" AND d.enriched_at_ms IS NULL");
+        }
+        sql.push_str(" ORDER BY f.rel_path LIMIT ?");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt
+            .query_map(params![limit], Self::document_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(docs)
+    }
+
+    /// Store one document's enrichment atomically: metadata update, facts,
+    /// tags, and a searchable summary chunk (replacing prior enrichment).
+    pub fn apply_enrichment(
+        &mut self,
+        document_id: i64,
+        record: &EnrichmentRecord,
+        model: &str,
+        now_ms: i64,
+    ) -> Result<(), IndexError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM chunks_fts WHERE rowid IN
+               (SELECT id FROM chunks WHERE document_id = ?1 AND is_summary = 1)",
+            params![document_id],
+        )?;
+        tx.execute(
+            "DELETE FROM chunks WHERE document_id = ?1 AND is_summary = 1",
+            params![document_id],
+        )?;
+        tx.execute("DELETE FROM facts WHERE document_id = ?1", params![document_id])?;
+        tx.execute("DELETE FROM tags WHERE document_id = ?1", params![document_id])?;
+        tx.execute(
+            "UPDATE documents SET
+               title = COALESCE(?2, title), doc_type = ?3, summary = ?4,
+               produced_by_model = ?5, enriched_at_ms = ?6
+             WHERE id = ?1",
+            params![
+                document_id,
+                record.title,
+                record.doc_type,
+                record.summary,
+                model,
+                now_ms
+            ],
+        )?;
+        {
+            let mut fact_stmt = tx.prepare_cached(
+                "INSERT INTO facts (document_id, key, value, value_norm, kind, page)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (key, value, kind, page) in &record.facts {
+                fact_stmt.execute(params![
+                    document_id,
+                    key,
+                    value,
+                    normalize_value(kind, value),
+                    kind,
+                    page
+                ])?;
+            }
+            let mut tag_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO tags (document_id, tag) VALUES (?1, ?2)",
+            )?;
+            for tag in &record.tags {
+                let tag = tag.trim().to_lowercase();
+                if !tag.is_empty() {
+                    tag_stmt.execute(params![document_id, tag])?;
+                }
+            }
+        }
+        let summary = record.summary.trim();
+        if !summary.is_empty() {
+            tx.execute(
+                "INSERT INTO chunks (document_id, seq, is_summary, page_start, page_end, text, content_hash)
+                 VALUES (?1, -1, 1, NULL, NULL, ?2, ?3)",
+                params![document_id, summary, crate::chunk::content_hash(summary)],
+            )?;
+            tx.execute(
+                "INSERT INTO chunks_fts (rowid, text) VALUES (?1, ?2)",
+                params![tx.last_insert_rowid(), summary],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Facts of one document, in insertion order.
+    pub fn facts_for_document(&self, document_id: i64) -> Result<Vec<FactRow>, IndexError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT f.rel_path, fa.document_id, fa.key, fa.value, fa.kind, fa.page
+             FROM facts fa
+             JOIN documents d ON d.id = fa.document_id
+             JOIN files f ON f.id = d.file_id
+             WHERE fa.document_id = ?1 ORDER BY fa.id",
+        )?;
+        let rows = stmt
+            .query_map(params![document_id], |r| {
+                Ok(FactRow {
+                    rel_path: r.get(0)?,
+                    document_id: r.get(1)?,
+                    key: r.get(2)?,
+                    value: r.get(3)?,
+                    kind: r.get(4)?,
+                    page: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Files currently in error state, with their messages.
     pub fn error_files(&self, limit: u32) -> Result<Vec<(String, String)>, IndexError> {
         let mut stmt = self.conn.prepare_cached(
@@ -840,6 +973,37 @@ impl IndexDb {
             .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+/// Best-effort machine-comparable form of a fact value: amounts lose
+/// currency dressing, dates become ISO. None when no normalization
+/// applies.
+fn normalize_value(kind: &str, value: &str) -> Option<String> {
+    match kind {
+        "amount" => {
+            let cleaned: String = value
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                .collect();
+            cleaned.parse::<f64>().ok().map(|n| {
+                if n.fract() == 0.0 {
+                    format!("{}", n as i64)
+                } else {
+                    format!("{n}")
+                }
+            })
+        }
+        "date" => {
+            let v = value.trim();
+            for fmt in ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"] {
+                if let Ok(d) = chrono::NaiveDate::parse_from_str(v, fmt) {
+                    return Some(d.format("%Y-%m-%d").to_string());
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -936,7 +1100,7 @@ mod tests {
     }
 
     fn index_file(db: &mut IndexDb, rel_path: &str, chunks: &[ChunkPiece]) {
-        db.upsert_indexed_file(rel_path, "text", 10, 1000, "sha", None, chunks, 2000)
+        db.upsert_indexed_file(rel_path, "text", 10, 1000, "sha", None, None, chunks, 2000)
             .unwrap();
     }
 
@@ -1096,6 +1260,94 @@ mod tests {
         let counts = db.status_counts().unwrap();
         assert!(counts.contains(&("indexed".to_string(), 1)));
         assert!(counts.contains(&("pending".to_string(), 2)));
+    }
+
+    #[test]
+    fn enrichment_roundtrips_and_summary_is_searchable() {
+        let (_dir, mut db) = open_temp();
+        index_file(&mut db, "House/closing.pdf", &[piece(0, "raw ocr text")]);
+        let doc = db.document_by_path("House/closing.pdf").unwrap().unwrap();
+        assert_eq!(db.documents_needing_enrichment(false, 10).unwrap().len(), 1);
+
+        let record = EnrichmentRecord {
+            title: Some("Closing Disclosure — 423 R St".into()),
+            doc_type: "closing_statement".into(),
+            summary: "Sale of 423 R St for $485,000, closing January 2026.".into(),
+            facts: vec![
+                (
+                    "sale_price".into(),
+                    "$485,000".into(),
+                    "amount".into(),
+                    Some(1),
+                ),
+                (
+                    "closing_date".into(),
+                    "01/13/2026".into(),
+                    "date".into(),
+                    None,
+                ),
+            ],
+            tags: vec!["Real-Estate".into(), "closing".into()],
+        };
+        db.apply_enrichment(doc.document_id, &record, "test-model", 5000)
+            .unwrap();
+
+        assert!(db.documents_needing_enrichment(false, 10).unwrap().is_empty());
+        let enriched = db.document_by_path("House/closing.pdf").unwrap().unwrap();
+        assert_eq!(enriched.doc_type.as_deref(), Some("closing_statement"));
+        assert_eq!(enriched.tags, vec!["closing", "real-estate"]);
+
+        // The summary chunk is searchable and facts are normalized.
+        assert!(!db.search("485,000", 10).unwrap().is_empty());
+        let facts = db.facts_for_document(doc.document_id).unwrap();
+        assert_eq!(facts.len(), 2);
+        let by_key = db
+            .search_facts(Some("sale_price"), None, None, 10)
+            .unwrap();
+        assert_eq!(by_key.len(), 1);
+
+        // Re-applying replaces rather than duplicates.
+        db.apply_enrichment(doc.document_id, &record, "test-model", 6000)
+            .unwrap();
+        assert_eq!(db.facts_for_document(doc.document_id).unwrap().len(), 2);
+        assert_eq!(db.chunk_count().unwrap(), 2); // 1 content + 1 summary
+    }
+
+    #[test]
+    fn reindexing_clears_enrichment_state() {
+        let (_dir, mut db) = open_temp();
+        index_file(&mut db, "a.txt", &[piece(0, "v1 text")]);
+        let doc = db.document_by_path("a.txt").unwrap().unwrap();
+        let record = EnrichmentRecord {
+            title: None,
+            doc_type: "note".into(),
+            summary: "a note".into(),
+            facts: vec![],
+            tags: vec![],
+        };
+        db.apply_enrichment(doc.document_id, &record, "m", 5000).unwrap();
+        // Content changed → re-ingest replaces the document row, so it
+        // needs enrichment again and the stale summary chunk is gone.
+        index_file(&mut db, "a.txt", &[piece(0, "v2 text")]);
+        assert_eq!(db.documents_needing_enrichment(false, 10).unwrap().len(), 1);
+        assert_eq!(db.chunk_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn normalize_value_handles_amounts_and_dates() {
+        assert_eq!(normalize_value("amount", "$485,000"), Some("485000".into()));
+        assert_eq!(normalize_value("amount", "$1,234.56"), Some("1234.56".into()));
+        assert_eq!(normalize_value("amount", "n/a"), None);
+        assert_eq!(
+            normalize_value("date", "01/13/2026"),
+            Some("2026-01-13".into())
+        );
+        assert_eq!(
+            normalize_value("date", "January 13, 2026"),
+            Some("2026-01-13".into())
+        );
+        assert_eq!(normalize_value("date", "sometime soon"), None);
+        assert_eq!(normalize_value("party", "Timothy Williams"), None);
     }
 
     #[test]
