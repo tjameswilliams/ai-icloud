@@ -152,7 +152,10 @@ fn check_transcription(config: &Config) -> Check {
     if !config.transcription.enabled {
         return Check::ok("transcription", "disabled — media files stay pending");
     }
-    match std::process::Command::new("ffmpeg").arg("-version").output() {
+    match std::process::Command::new(crate::extract::media::ffmpeg_bin())
+        .arg("-version")
+        .output()
+    {
         Ok(out) if out.status.success() => Check::ok(
             "transcription",
             format!(

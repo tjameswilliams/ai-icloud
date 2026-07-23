@@ -68,10 +68,21 @@ impl Transcriber {
     }
 }
 
+/// ffmpeg lives in Homebrew's prefix, which launchd agents don't have on
+/// PATH — resolve known locations before falling back to lookup.
+pub fn ffmpeg_bin() -> &'static str {
+    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+        if Path::new(candidate).exists() {
+            return candidate;
+        }
+    }
+    "ffmpeg"
+}
+
 /// ffmpeg → 16kHz mono f32le PCM on stdout. ffmpeg handles every
 /// container/codec we scope in (mp3, m4a, mp4, mov, wav).
 fn decode_to_pcm(path: &Path) -> Result<Vec<f32>> {
-    let mut child = Command::new("ffmpeg")
+    let mut child = Command::new(ffmpeg_bin())
         .args(["-v", "error", "-i"])
         .arg(path)
         .args(["-vn", "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"])
