@@ -15,6 +15,7 @@ use crate::embed::Embedder;
 use crate::extract;
 use crate::index::{FileStatus, IndexDb};
 use crate::scan::{ScanPlan, ScannedFile};
+use crate::sidecar::Sidecar;
 
 /// What one ingest run did.
 #[derive(Debug, Default, PartialEq)]
@@ -67,8 +68,30 @@ pub fn ingest(db: &mut IndexDb, config: &Config, plan: ScanPlan, now_ms: i64) ->
         }
     }
 
+    // The OCR sidecar is only materialized when this run needs it; if it
+    // cannot start, PDF/image files land in `error` state and retry on the
+    // next scan.
+    let sidecar = if plan
+        .to_index
+        .iter()
+        .any(|f| !f.evicted && f.kind.needs_sidecar())
+    {
+        match config
+            .index_dir()
+            .and_then(|dir| Sidecar::ensure(&dir.join("bin")))
+        {
+            Ok(s) => Some(s),
+            Err(err) => {
+                tracing::warn!("OCR sidecar unavailable: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     for file in &plan.to_index {
-        match ingest_one(db, config, file, now_ms) {
+        match ingest_one(db, config, file, sidecar.as_ref(), now_ms) {
             Ok(status) => match status {
                 FileStatus::Indexed => report.indexed += 1,
                 FileStatus::Pending => report.pending += 1,
@@ -89,6 +112,7 @@ fn ingest_one(
     db: &mut IndexDb,
     config: &Config,
     file: &ScannedFile,
+    sidecar: Option<&Sidecar>,
     now_ms: i64,
 ) -> Result<FileStatus> {
     let kind = file.kind.as_str();
@@ -118,7 +142,7 @@ fn ingest_one(
         return Ok(FileStatus::Pending);
     }
 
-    let extracted = match extract::extract(&file.abs_path, file.kind) {
+    let extracted = match extract::extract(&file.abs_path, file.kind, sidecar) {
         Ok(doc) => doc,
         Err(err) => {
             tracing::warn!("extraction failed for {}: {err:#}", file.rel_path);
@@ -149,11 +173,19 @@ fn ingest_one(
         }
     };
 
-    let pieces = chunk::chunk_text(
-        &extracted.text,
-        config.index.chunk_target_tokens,
-        config.index.chunk_overlap_tokens,
-    );
+    let pieces = if extracted.pages.len() > 1 {
+        chunk::chunk_pages(
+            &extracted.pages,
+            config.index.chunk_target_tokens,
+            config.index.chunk_overlap_tokens,
+        )
+    } else {
+        chunk::chunk_text(
+            extracted.pages.first().map(String::as_str).unwrap_or(""),
+            config.index.chunk_target_tokens,
+            config.index.chunk_overlap_tokens,
+        )
+    };
     tracing::info!("indexed {} ({} chunks)", file.rel_path, pieces.len());
     db.upsert_indexed_file(
         &file.rel_path,
@@ -307,11 +339,23 @@ mod tests {
     #[test]
     fn unsupported_kinds_wait_as_pending() {
         let (tree, _dbdir, mut db, config) = setup();
-        fs::write(tree.path().join("scan.pdf"), "%PDF-1.4 fake").unwrap();
+        fs::write(tree.path().join("memo.mp3"), "not really audio").unwrap();
         let report = run_scan(tree.path(), &mut db, &config);
         assert_eq!(report.pending, 1);
         let states = db.file_states().unwrap();
-        assert_eq!(states["scan.pdf"].status, "pending");
+        assert_eq!(states["memo.mp3"].status, "pending");
+    }
+
+    #[test]
+    fn corrupt_pdf_lands_in_error_state_and_keeps_the_scan_alive() {
+        let (tree, _dbdir, mut db, config) = setup();
+        fs::write(tree.path().join("broken.pdf"), "%PDF-1.4 not a real pdf").unwrap();
+        fs::write(tree.path().join("fine.txt"), "still indexed").unwrap();
+        let report = run_scan(tree.path(), &mut db, &config);
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.indexed, 1);
+        let states = db.file_states().unwrap();
+        assert_eq!(states["broken.pdf"].status, "error");
     }
 
     #[test]

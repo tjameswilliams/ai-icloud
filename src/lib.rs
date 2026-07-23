@@ -14,3 +14,4 @@ pub mod ingest;
 pub mod paths;
 pub mod retrieve;
 pub mod scan;
+pub mod sidecar;

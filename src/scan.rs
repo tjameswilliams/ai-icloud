@@ -377,12 +377,12 @@ mod tests {
     fn plan_picks_up_pending_files_once_extractable() {
         let mut states = HashMap::new();
         states.insert("doc.txt".to_string(), state(5, 100, "pending"));
-        states.insert("doc.pdf".to_string(), state(5, 100, "pending"));
-        let mut pdf = scanned("doc.pdf", 5, 100);
-        pdf.kind = FileKind::Pdf;
-        let p = plan(vec![scanned("doc.txt", 5, 100), pdf], &states);
+        states.insert("talk.mp3".to_string(), state(5, 100, "pending"));
+        let mut audio = scanned("talk.mp3", 5, 100);
+        audio.kind = FileKind::Audio;
+        let p = plan(vec![scanned("doc.txt", 5, 100), audio], &states);
         let rels: Vec<&str> = p.to_index.iter().map(|f| f.rel_path.as_str()).collect();
-        // txt now has an extractor; pdf still waits.
+        // txt has an extractor; audio still waits for its phase.
         assert_eq!(rels, vec!["doc.txt"]);
         assert_eq!(p.unchanged, 1);
     }

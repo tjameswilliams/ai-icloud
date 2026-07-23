@@ -60,6 +60,7 @@ pub fn run_checks(config: &Config) -> Result<Vec<Check>> {
     Ok(vec![
         check_source_root(config),
         check_index(config),
+        check_sidecar(config),
         check_embeddings_config(config),
         check_llm_endpoint(config),
     ])
@@ -124,6 +125,24 @@ fn check_index(config: &Config) -> Check {
             "index",
             format!("could not open {}: {e}", path.display()),
             "check permissions on the index directory, or move [index] database_path",
+        ),
+    }
+}
+
+fn check_sidecar(config: &Config) -> Check {
+    let dir = match config.index_dir() {
+        Ok(d) => d.join("bin"),
+        Err(e) => return Check::fail("ocr sidecar", format!("{e:#}"), "check [index] database_path"),
+    };
+    match crate::sidecar::Sidecar::ensure(&dir) {
+        Ok(_) => Check::ok(
+            "ocr sidecar",
+            "Vision OCR helper materialized and answering",
+        ),
+        Err(e) => Check::fail(
+            "ocr sidecar",
+            format!("{e:#}"),
+            "PDF/image extraction will fail; check permissions on the index directory",
         ),
     }
 }

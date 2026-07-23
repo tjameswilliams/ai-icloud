@@ -28,7 +28,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     std::fs::write(tree.join("Private/secret.txt"), "do not index me").unwrap();
-    std::fs::write(tree.join("scan.pdf"), "%PDF-1.4 not yet supported").unwrap();
+    std::fs::write(tree.join("voice-memo.mp3"), "fake audio bytes").unwrap();
 
     let index_path = dir.path().join("appdir").join("index.sqlite");
     let config_path = dir.path().join("config.toml");
@@ -76,7 +76,7 @@ fn dry_run_reports_without_creating_an_index() {
         .success()
         .stdout(predicate::str::contains("would index 3 file(s)"))
         .stdout(predicate::str::contains("House/closing-statement.txt"))
-        .stdout(predicate::str::contains("scan.pdf [pdf]"))
+        .stdout(predicate::str::contains("voice-memo.mp3 [audio]"))
         .stdout(predicate::str::contains("Private").not());
     // Dry run must leave no index behind.
     let index_exists = fx
@@ -136,7 +136,7 @@ fn rescan_is_incremental_and_deletion_prunes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("0 indexed"))
-        // Two indexed text files plus the still-pending pdf.
+        // Two indexed text files plus the still-pending mp3.
         .stdout(predicate::str::contains("3 unchanged"));
 
     std::fs::remove_file(fx.tree.join("groceries.md")).unwrap();
