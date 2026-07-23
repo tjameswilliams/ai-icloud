@@ -35,7 +35,15 @@ pub struct ScanPlan {
     /// rel_paths present in the index but gone from disk (or newly excluded).
     pub to_remove: Vec<String>,
     pub unchanged: usize,
+    /// Removals quarantined by the circuit breaker: the scan claims a
+    /// large share of the index vanished at once, which usually means the
+    /// scan itself failed (permissions, unmounted tree) rather than a
+    /// genuine mass deletion. Only an explicit override executes these.
+    pub suspicious_removals: Vec<String>,
 }
+
+/// Removals at or above this count are eligible for quarantine.
+const MASS_REMOVAL_MIN: usize = 10;
 
 /// Compiled exclusion globs, matched against rel_paths.
 pub struct Excludes {
@@ -73,6 +81,19 @@ pub fn scan_tree(root: &Path, source: &SourceConfig) -> Result<Vec<ScannedFile>>
             "source root {} does not exist or is not a directory",
             root.display()
         );
+    }
+    // An unreadable root must be a hard error: silently returning an
+    // empty tree would read as "every file was deleted".
+    if let Err(e) = std::fs::read_dir(root) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            bail!(
+                "reading {} was denied — grant Full Disk Access to this binary \
+                 (System Settings → Privacy & Security → Full Disk Access); a \
+                 launchd daemon needs the grant on the binary itself",
+                root.display()
+            );
+        }
+        return Err(e).with_context(|| format!("could not read {}", root.display()));
     }
     let excludes = Excludes::compile(&source.exclude_globs)?;
     let max_bytes = source.max_file_mb.saturating_mul(1024 * 1024);
@@ -219,6 +240,16 @@ pub fn plan(scanned: Vec<ScannedFile>, states: &HashMap<String, FileState>) -> S
         }
     }
     plan.to_remove.sort();
+
+    // Circuit breaker: an empty scan over a non-empty index, or a removal
+    // of most of the index at once, is far more likely a failed scan than
+    // a real purge. Quarantine instead of deleting.
+    let scan_empty = seen.is_empty() && !states.is_empty();
+    let mass_removal =
+        plan.to_remove.len() >= MASS_REMOVAL_MIN && plan.to_remove.len() * 2 > states.len();
+    if scan_empty || mass_removal {
+        plan.suspicious_removals = std::mem::take(&mut plan.to_remove);
+    }
     plan
 }
 
@@ -357,8 +388,54 @@ mod tests {
     fn plan_removes_files_gone_from_disk() {
         let mut states = HashMap::new();
         states.insert("gone.txt".to_string(), state(5, 100, "indexed"));
-        let p = plan(vec![], &states);
+        states.insert("still-here.txt".to_string(), state(5, 100, "indexed"));
+        let p = plan(vec![scanned("still-here.txt", 5, 100)], &states);
         assert_eq!(p.to_remove, vec!["gone.txt"]);
+        assert!(p.suspicious_removals.is_empty());
+    }
+
+    #[test]
+    fn empty_scan_over_nonempty_index_quarantines_all_removals() {
+        // The failure mode that once wiped the index: an unreadable tree
+        // looks exactly like "everything was deleted".
+        let mut states = HashMap::new();
+        states.insert("a.txt".to_string(), state(5, 100, "indexed"));
+        let p = plan(vec![], &states);
+        assert!(p.to_remove.is_empty());
+        assert_eq!(p.suspicious_removals, vec!["a.txt"]);
+    }
+
+    #[test]
+    fn mass_removal_is_quarantined_but_small_removals_pass() {
+        let mut states = HashMap::new();
+        for i in 0..20 {
+            states.insert(format!("f{i:02}.txt"), state(5, 100, "indexed"));
+        }
+        // 15 of 20 vanish at once → quarantined.
+        let survivors: Vec<ScannedFile> =
+            (0..5).map(|i| scanned(&format!("f{i:02}.txt"), 5, 100)).collect();
+        let p = plan(survivors, &states);
+        assert!(p.to_remove.is_empty());
+        assert_eq!(p.suspicious_removals.len(), 15);
+
+        // 5 of 20 vanish → executed normally (below the min count).
+        let survivors: Vec<ScannedFile> =
+            (0..15).map(|i| scanned(&format!("f{i:02}.txt"), 5, 100)).collect();
+        let p = plan(survivors, &states);
+        assert_eq!(p.to_remove.len(), 5);
+        assert!(p.suspicious_removals.is_empty());
+    }
+
+    #[test]
+    fn unreadable_root_is_a_hard_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locked");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = scan_tree(&root, &source(&[])).unwrap_err().to_string();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.contains("denied"), "{err}");
     }
 
     #[test]

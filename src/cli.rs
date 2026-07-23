@@ -48,6 +48,9 @@ enum Command {
         /// Skip the LLM enrichment pass
         #[arg(long)]
         no_enrich: bool,
+        /// Execute removals the mass-removal circuit breaker quarantined
+        #[arg(long)]
+        force_removals: bool,
     },
     /// Run LLM enrichment (summary, doc_type, facts, tags) on indexed
     /// documents that lack it
@@ -138,7 +141,8 @@ pub fn run() -> Result<()> {
             dry_run,
             no_embed,
             no_enrich,
-        } => run_scan(&loaded, dry_run, no_embed, no_enrich),
+            force_removals,
+        } => run_scan(&loaded, dry_run, no_embed, no_enrich, force_removals),
         Command::Enrich { force, limit } => run_enrich(&loaded, force, limit),
         Command::Search {
             query,
@@ -272,7 +276,13 @@ fn run_doctor(loaded: &LoadedConfig) -> Result<()> {
     }
 }
 
-fn run_scan(loaded: &LoadedConfig, dry_run: bool, no_embed: bool, no_enrich: bool) -> Result<()> {
+fn run_scan(
+    loaded: &LoadedConfig,
+    dry_run: bool,
+    no_embed: bool,
+    no_enrich: bool,
+    force_removals: bool,
+) -> Result<()> {
     let config = &loaded.config;
     let root = config.source_root()?;
     let scanned = scan::scan_tree(&root, &config.source)?;
@@ -302,7 +312,11 @@ fn run_scan(loaded: &LoadedConfig, dry_run: bool, no_embed: bool, no_enrich: boo
     }
 
     let mut db = IndexDb::open(&config.index_db_path()?)?;
-    let plan = scan::plan(scanned, &db.file_states()?);
+    let mut plan = scan::plan(scanned, &db.file_states()?);
+    if force_removals {
+        plan.to_remove.append(&mut plan.suspicious_removals);
+        plan.to_remove.sort();
+    }
     let mut report = ingest::ingest(&mut db, config, plan, chrono::Utc::now().timestamp_millis());
     report.pruned_embeddings = db.prune_orphan_embeddings()?;
 

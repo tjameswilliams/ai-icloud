@@ -28,11 +28,13 @@ pub struct IngestReport {
     pub unchanged: usize,
     pub embedded: usize,
     pub pruned_embeddings: u64,
+    /// Removals the circuit breaker refused to execute.
+    pub refused_removals: usize,
 }
 
 impl IngestReport {
     pub fn summary(&self) -> String {
-        format!(
+        let mut s = format!(
             "{} indexed, {} pending, {} evicted, {} errors, {} removed, {} unchanged, \
              {} chunks embedded, {} orphan embeddings pruned",
             self.indexed,
@@ -43,7 +45,14 @@ impl IngestReport {
             self.unchanged,
             self.embedded,
             self.pruned_embeddings
-        )
+        );
+        if self.refused_removals > 0 {
+            s.push_str(&format!(
+                "; REFUSED {} suspicious removal(s) — see log",
+                self.refused_removals
+            ));
+        }
+        s
     }
 }
 
@@ -51,8 +60,19 @@ impl IngestReport {
 pub fn ingest(db: &mut IndexDb, config: &Config, plan: ScanPlan, now_ms: i64) -> IngestReport {
     let mut report = IngestReport {
         unchanged: plan.unchanged,
+        refused_removals: plan.suspicious_removals.len(),
         ..IngestReport::default()
     };
+    if !plan.suspicious_removals.is_empty() {
+        tracing::error!(
+            "refusing to remove {} file(s) the scan no longer sees — this \
+             usually means the scan failed to read the source (permissions, \
+             unmounted volume), not that the files were deleted. Check \
+             `ai-icloud doctor`; if the deletion is real, run \
+             `ai-icloud scan --force-removals`.",
+            plan.suspicious_removals.len()
+        );
+    }
 
     for rel_path in &plan.to_remove {
         match db.remove_file(rel_path) {
@@ -455,14 +475,32 @@ mod tests {
         let (tree, _dbdir, mut db, config) = setup();
         let path = tree.path().join("a.txt");
         fs::write(&path, "hello world").unwrap();
+        // A survivor keeps the deletion below the mass-removal breaker.
+        fs::write(tree.path().join("keep.txt"), "still here").unwrap();
         run_scan(tree.path(), &mut db, &config);
-        assert_eq!(db.file_count().unwrap(), 1);
+        assert_eq!(db.file_count().unwrap(), 2);
 
         fs::remove_file(&path).unwrap();
         let report = run_scan(tree.path(), &mut db, &config);
         assert_eq!(report.removed, 1);
-        assert_eq!(db.file_count().unwrap(), 0);
+        assert_eq!(db.file_count().unwrap(), 1);
         assert!(db.search("hello", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_every_file_is_quarantined_not_executed() {
+        let (tree, _dbdir, mut db, config) = setup();
+        let path = tree.path().join("only.txt");
+        fs::write(&path, "sole content").unwrap();
+        run_scan(tree.path(), &mut db, &config);
+        fs::remove_file(&path).unwrap();
+
+        let report = run_scan(tree.path(), &mut db, &config);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.refused_removals, 1);
+        // The index keeps the file until the removal is forced.
+        assert_eq!(db.file_count().unwrap(), 1);
+        assert!(report.summary().contains("REFUSED"));
     }
 
     #[test]
