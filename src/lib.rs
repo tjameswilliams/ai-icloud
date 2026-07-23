@@ -11,6 +11,7 @@ pub mod embed;
 pub mod extract;
 pub mod index;
 pub mod ingest;
+pub mod mcp;
 pub mod paths;
 pub mod retrieve;
 pub mod scan;

@@ -163,6 +163,45 @@ pub struct FileState {
     pub status: String,
 }
 
+/// A document with its file metadata, as served by the MCP tools.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentInfo {
+    pub document_id: i64,
+    pub rel_path: String,
+    pub kind: String,
+    pub title: Option<String>,
+    pub doc_type: Option<String>,
+    pub summary: Option<String>,
+    pub size: i64,
+    pub mtime_ms: i64,
+    pub indexed_at_ms: Option<i64>,
+    pub chunk_count: i64,
+    pub tags: Vec<String>,
+}
+
+/// One stored chunk row (used for document text and context windows).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkRow {
+    pub id: i64,
+    pub document_id: i64,
+    pub seq: i64,
+    pub is_summary: bool,
+    pub page_start: Option<i64>,
+    pub page_end: Option<i64>,
+    pub text: String,
+}
+
+/// One extracted fact (populated by the enrichment phase).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactRow {
+    pub rel_path: String,
+    pub document_id: i64,
+    pub key: String,
+    pub value: String,
+    pub kind: String,
+    pub page: Option<i64>,
+}
+
 /// One search result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
@@ -598,6 +637,222 @@ impl IndexDb {
             None => Ok(None),
         }
     }
+
+    // ---------------------------------------------------------- documents
+
+    const DOCUMENT_SELECT: &'static str = "
+        SELECT d.id, f.rel_path, f.kind, d.title, d.doc_type, d.summary,
+               f.size, f.mtime_ms, f.indexed_at_ms,
+               (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id)
+        FROM documents d JOIN files f ON f.id = d.file_id";
+
+    fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentInfo> {
+        Ok(DocumentInfo {
+            document_id: row.get(0)?,
+            rel_path: row.get(1)?,
+            kind: row.get(2)?,
+            title: row.get(3)?,
+            doc_type: row.get(4)?,
+            summary: row.get(5)?,
+            size: row.get(6)?,
+            mtime_ms: row.get(7)?,
+            indexed_at_ms: row.get(8)?,
+            chunk_count: row.get(9)?,
+            tags: Vec::new(),
+        })
+    }
+
+    fn with_tags(&self, mut doc: DocumentInfo) -> Result<DocumentInfo, IndexError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT tag FROM tags WHERE document_id = ?1 ORDER BY tag")?;
+        doc.tags = stmt
+            .query_map(params![doc.document_id], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(doc)
+    }
+
+    pub fn document_by_id(&self, document_id: i64) -> Result<Option<DocumentInfo>, IndexError> {
+        let sql = format!("{} WHERE d.id = ?1", Self::DOCUMENT_SELECT);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let doc = stmt
+            .query_map(params![document_id], Self::document_from_row)?
+            .next()
+            .transpose()?;
+        doc.map(|d| self.with_tags(d)).transpose()
+    }
+
+    pub fn document_by_path(&self, rel_path: &str) -> Result<Option<DocumentInfo>, IndexError> {
+        let sql = format!("{} WHERE f.rel_path = ?1", Self::DOCUMENT_SELECT);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let doc = stmt
+            .query_map(params![rel_path], Self::document_from_row)?
+            .next()
+            .transpose()?;
+        doc.map(|d| self.with_tags(d)).transpose()
+    }
+
+    /// Documents matching optional filters, most recently indexed first.
+    pub fn list_documents(
+        &self,
+        path_filter: Option<&str>,
+        doc_type: Option<&str>,
+        tag: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DocumentInfo>, IndexError> {
+        let mut sql = format!("{} WHERE 1=1", Self::DOCUMENT_SELECT);
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(f) = path_filter {
+            sql.push_str(
+                " AND (f.rel_path LIKE '%' || ? || '%' OR d.title LIKE '%' || ? || '%')",
+            );
+            args.push(Box::new(f.to_string()));
+            args.push(Box::new(f.to_string()));
+        }
+        if let Some(t) = doc_type {
+            sql.push_str(" AND d.doc_type = ?");
+            args.push(Box::new(t.to_string()));
+        }
+        if let Some(t) = tag {
+            sql.push_str(" AND d.id IN (SELECT document_id FROM tags WHERE tag = ?)");
+            args.push(Box::new(t.to_string()));
+        }
+        sql.push_str(" ORDER BY f.indexed_at_ms DESC, f.rel_path LIMIT ?");
+        args.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt
+            .query_map(
+                rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+                Self::document_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        docs.into_iter().map(|d| self.with_tags(d)).collect()
+    }
+
+    /// All chunks of a document in reading order (summary chunk first if
+    /// one exists).
+    pub fn document_chunks(&self, document_id: i64) -> Result<Vec<ChunkRow>, IndexError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, document_id, seq, is_summary, page_start, page_end, text
+             FROM chunks WHERE document_id = ?1
+             ORDER BY is_summary DESC, seq",
+        )?;
+        let rows = stmt
+            .query_map(params![document_id], chunk_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One chunk plus up to `before`/`after` neighbors from the same
+    /// document, in order. None when the chunk does not exist.
+    pub fn chunk_window(
+        &self,
+        chunk_id: i64,
+        before: u32,
+        after: u32,
+    ) -> Result<Option<Vec<ChunkRow>>, IndexError> {
+        let target: Option<(i64, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT document_id, seq FROM chunks WHERE id = ?1")?;
+            let mut rows = stmt.query(params![chunk_id])?;
+            match rows.next()? {
+                Some(row) => Some((row.get(0)?, row.get(1)?)),
+                None => None,
+            }
+        };
+        let Some((document_id, seq)) = target else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, document_id, seq, is_summary, page_start, page_end, text
+             FROM chunks
+             WHERE document_id = ?1 AND is_summary = 0 AND seq BETWEEN ?2 AND ?3
+             ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![document_id, seq - before as i64, seq + after as i64],
+                chunk_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(rows))
+    }
+
+    /// Search extracted facts (enrichment phase populates these).
+    pub fn search_facts(
+        &self,
+        key: Option<&str>,
+        kind: Option<&str>,
+        value_contains: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<FactRow>, IndexError> {
+        let mut sql = String::from(
+            "SELECT f.rel_path, fa.document_id, fa.key, fa.value, fa.kind, fa.page
+             FROM facts fa
+             JOIN documents d ON d.id = fa.document_id
+             JOIN files f ON f.id = d.file_id
+             WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(k) = key {
+            sql.push_str(" AND fa.key LIKE '%' || ? || '%'");
+            args.push(Box::new(k.to_string()));
+        }
+        if let Some(k) = kind {
+            sql.push_str(" AND fa.kind = ?");
+            args.push(Box::new(k.to_string()));
+        }
+        if let Some(v) = value_contains {
+            sql.push_str(" AND fa.value LIKE '%' || ? || '%'");
+            args.push(Box::new(v.to_string()));
+        }
+        sql.push_str(" ORDER BY f.rel_path, fa.key LIMIT ?");
+        args.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+                |r| {
+                    Ok(FactRow {
+                        rel_path: r.get(0)?,
+                        document_id: r.get(1)?,
+                        key: r.get(2)?,
+                        value: r.get(3)?,
+                        kind: r.get(4)?,
+                        page: r.get(5)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Files currently in error state, with their messages.
+    pub fn error_files(&self, limit: u32) -> Result<Vec<(String, String)>, IndexError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rel_path, COALESCE(error, '') FROM files
+             WHERE status = 'error' ORDER BY rel_path LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+fn chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
+    Ok(ChunkRow {
+        id: row.get(0)?,
+        document_id: row.get(1)?,
+        seq: row.get(2)?,
+        is_summary: row.get::<_, i64>(3)? != 0,
+        page_start: row.get(4)?,
+        page_end: row.get(5)?,
+        text: row.get(6)?,
+    })
 }
 
 /// Remove the document, chunks (incl. FTS mirror), facts, and tags derived

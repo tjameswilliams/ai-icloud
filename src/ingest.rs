@@ -239,6 +239,70 @@ pub fn embed_missing(db: &mut IndexDb, embedder: &mut dyn Embedder) -> Result<us
     Ok(done)
 }
 
+/// Re-ingest one path immediately (MCP `reindex_file` and future watch
+/// events): stat it, run it through the pipeline, embed anything missing.
+/// A path that vanished from disk is removed from the index.
+pub fn reindex_path(db: &mut IndexDb, config: &Config, rel_path: &str) -> Result<String> {
+    use std::time::UNIX_EPOCH;
+
+    let root = config.source_root()?;
+    let abs = root.join(rel_path);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    let meta = match std::fs::metadata(&abs) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => anyhow::bail!("{rel_path} is not a regular file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if db.remove_file(rel_path)? {
+                db.prune_orphan_embeddings()?;
+                Ok(format!("{rel_path} no longer exists on disk; removed from the index"))
+            } else {
+                anyhow::bail!("{rel_path} does not exist on disk or in the index")
+            };
+        }
+        Err(e) => return Err(e).context(format!("could not stat {}", abs.display())),
+    };
+
+    let ext = abs
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let kind = crate::extract::FileKind::from_extension(&ext)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized file type .{ext}"))?;
+    let file = ScannedFile {
+        rel_path: rel_path.to_string(),
+        abs_path: abs,
+        kind,
+        size: meta.len() as i64,
+        mtime_ms: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+        evicted: false,
+    };
+
+    let sidecar = if kind.needs_sidecar() {
+        Some(Sidecar::ensure(&config.index_dir()?.join("bin"))?)
+    } else {
+        None
+    };
+    let status = ingest_one(db, config, &file, sidecar.as_ref(), now_ms)?;
+    db.prune_orphan_embeddings()?;
+
+    let mut embedded = 0;
+    if status == FileStatus::Indexed {
+        let model_dir = config.index_dir()?.join("models");
+        let mut embedder = crate::embed::make_embedder(config, &model_dir)?;
+        embedded = embed_missing(db, embedder.as_mut())?;
+    }
+    Ok(format!(
+        "{rel_path}: status {}, {embedded} chunk(s) embedded",
+        status.as_str()
+    ))
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     use io::Read;
     let mut file =

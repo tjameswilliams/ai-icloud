@@ -60,6 +60,15 @@ enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Serve MCP over stdio (default) or HTTP
+    Serve {
+        /// Bind an HTTP listener (e.g. 127.0.0.1:8787) instead of stdio;
+        /// requests need `Authorization: Bearer <token>` (see `connect`)
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
+    },
+    /// Print the HTTP bearer token (generating it on first use)
+    Connect,
     /// Show or locate the configuration
     Config {
         #[command(subcommand)]
@@ -89,8 +98,88 @@ pub fn run() -> Result<()> {
             keyword,
             semantic,
         } => run_search(&loaded, &query.join(" "), limit, keyword, semantic),
+        Command::Serve { http } => run_serve(&loaded, http.as_deref()),
+        Command::Connect => {
+            println!("{}", load_or_create_http_token(&loaded.config)?);
+            Ok(())
+        }
         Command::Config { action } => run_config(&loaded, action),
     }
+}
+
+fn run_serve(loaded: &LoadedConfig, http: Option<&str>) -> Result<()> {
+    let config = &loaded.config;
+    let db = IndexDb::open(&config.index_db_path()?)?;
+    let mut server = crate::mcp::McpServer::new(db, config.clone());
+
+    match http {
+        Some(addr) => {
+            let token = load_or_create_http_token(config)?;
+            crate::mcp::serve_http(&mut server, addr, &token)
+        }
+        None => {
+            // stdio: newline-delimited JSON-RPC; stdout is protocol-only.
+            use std::io::{BufRead, Write};
+            let stdin = std::io::stdin();
+            let mut stdout = std::io::stdout();
+            for line in stdin.lock().lines() {
+                let line = line.context("could not read stdin")?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let msg: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = crate::mcp::rpc_error(
+                            serde_json::Value::Null,
+                            -32700,
+                            &format!("parse error: {e}"),
+                        );
+                        writeln!(stdout, "{err}")?;
+                        stdout.flush()?;
+                        continue;
+                    }
+                };
+                if let Some(resp) = server.handle(&msg) {
+                    writeln!(stdout, "{resp}")?;
+                    stdout.flush()?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The HTTP bearer token: from config if set, else generated once from
+/// the system RNG and stored 0600 next to the index.
+fn load_or_create_http_token(config: &crate::config::Config) -> Result<String> {
+    if let Some(token) = &config.service.http_token
+        && !token.trim().is_empty()
+    {
+        return Ok(token.trim().to_string());
+    }
+    let dir = config.index_dir()?;
+    let path = dir.join("http-token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .context("could not read random bytes for the token")?;
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&path, &token)
+        .with_context(|| format!("could not write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(token)
 }
 
 fn init_tracing(verbose: u8) {
