@@ -17,4 +17,6 @@ pub mod mcp;
 pub mod paths;
 pub mod retrieve;
 pub mod scan;
+pub mod service;
 pub mod sidecar;
+pub mod watch;

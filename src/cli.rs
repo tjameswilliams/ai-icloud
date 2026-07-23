@@ -73,6 +73,14 @@ enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Watch the source tree and index changes continuously (the daemon
+    /// entry point; see `service install`)
+    Watch,
+    /// Manage the launchd agents (watch daemon, optional HTTP server)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Serve MCP over stdio (default) or HTTP
     Serve {
         /// Bind an HTTP listener (e.g. 127.0.0.1:8787) instead of stdio;
@@ -87,6 +95,28 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Write launchd plists and load them
+    Install {
+        /// Write plists without loading them into launchd
+        #[arg(long)]
+        no_load: bool,
+        /// Also install the MCP HTTP server agent on this address
+        #[arg(long, value_name = "ADDR", num_args = 0..=1,
+              default_missing_value = crate::service::DEFAULT_HTTP_ADDR)]
+        http: Option<String>,
+    },
+    /// Load installed agents
+    Start,
+    /// Unload agents (kept installed)
+    Stop,
+    /// Unload and delete the agents
+    Uninstall,
+    /// Show install/running state
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -116,6 +146,19 @@ pub fn run() -> Result<()> {
             keyword,
             semantic,
         } => run_search(&loaded, &query.join(" "), limit, keyword, semantic),
+        Command::Watch => crate::watch::run_watch(&loaded),
+        Command::Service { action } => match action {
+            ServiceAction::Install { no_load, http } => crate::service::install(
+                &loaded,
+                cli.config.as_deref(),
+                no_load,
+                http.as_deref(),
+            ),
+            ServiceAction::Start => crate::service::start(),
+            ServiceAction::Stop => crate::service::stop(),
+            ServiceAction::Uninstall => crate::service::uninstall(),
+            ServiceAction::Status => crate::service::status(&loaded),
+        },
         Command::Serve { http } => run_serve(&loaded, http.as_deref()),
         Command::Connect => {
             println!("{}", load_or_create_http_token(&loaded.config)?);

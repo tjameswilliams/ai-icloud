@@ -119,6 +119,21 @@ fn ingest_one(
 
     if file.evicted {
         tracing::info!("evicted (content not local): {}", file.rel_path);
+        // Best-effort: ask iCloud to materialize it; the download will fire
+        // change events and the file indexes on a later pass.
+        match std::process::Command::new("brctl")
+            .arg("download")
+            .arg(&file.abs_path)
+            .output()
+        {
+            Ok(out) if !out.status.success() => tracing::warn!(
+                "brctl download failed for {}: {}",
+                file.rel_path,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(err) => tracing::warn!("could not run brctl: {err}"),
+            _ => {}
+        }
         db.upsert_unextracted_file(
             &file.rel_path,
             kind,
