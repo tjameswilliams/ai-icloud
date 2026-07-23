@@ -141,31 +141,7 @@ fn ingest_one(
     let kind = file.kind.as_str();
 
     if file.evicted {
-        tracing::info!("evicted (content not local): {}", file.rel_path);
-        // Best-effort: ask iCloud to materialize it; the download will fire
-        // change events and the file indexes on a later pass.
-        match std::process::Command::new("brctl")
-            .arg("download")
-            .arg(&file.abs_path)
-            .output()
-        {
-            Ok(out) if !out.status.success() => tracing::warn!(
-                "brctl download failed for {}: {}",
-                file.rel_path,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(err) => tracing::warn!("could not run brctl: {err}"),
-            _ => {}
-        }
-        db.upsert_unextracted_file(
-            &file.rel_path,
-            kind,
-            file.size,
-            file.mtime_ms,
-            FileStatus::Evicted,
-            None,
-        )?;
-        return Ok(FileStatus::Evicted);
+        return mark_evicted(db, file);
     }
 
     // Media stays pending when transcription is switched off.
@@ -183,6 +159,12 @@ fn ingest_one(
 
     let extracted = match extract::extract(&file.abs_path, file.kind, extractors) {
         Ok(doc) => doc,
+        // EDEADLK ("Resource deadlock avoided") is macOS's dataless-file
+        // error: the content is evicted WITHOUT a .icloud stub. Not a real
+        // failure — ask for a download and retry on a later pass.
+        Err(err) if format!("{err:#}").contains("deadlock") => {
+            return mark_evicted(db, file);
+        }
         Err(err) => {
             tracing::warn!("extraction failed for {}: {err:#}", file.rel_path);
             db.upsert_unextracted_file(
@@ -238,6 +220,35 @@ fn ingest_one(
         now_ms,
     )?;
     Ok(FileStatus::Indexed)
+}
+
+/// Record a file whose content is not local (stub or dataless) and ask
+/// iCloud to materialize it; the download fires change events and the
+/// file indexes on a later pass.
+fn mark_evicted(db: &mut IndexDb, file: &ScannedFile) -> Result<FileStatus> {
+    tracing::info!("evicted (content not local): {}", file.rel_path);
+    match std::process::Command::new("/usr/bin/brctl")
+        .arg("download")
+        .arg(&file.abs_path)
+        .output()
+    {
+        Ok(out) if !out.status.success() => tracing::warn!(
+            "brctl download failed for {}: {}",
+            file.rel_path,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(err) => tracing::warn!("could not run brctl: {err}"),
+        _ => {}
+    }
+    db.upsert_unextracted_file(
+        &file.rel_path,
+        file.kind.as_str(),
+        file.size,
+        file.mtime_ms,
+        FileStatus::Evicted,
+        None,
+    )?;
+    Ok(FileStatus::Evicted)
 }
 
 /// Embed every chunk that lacks a vector, committing per batch so an
