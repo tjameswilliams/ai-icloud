@@ -61,6 +61,7 @@ pub fn run_checks(config: &Config) -> Result<Vec<Check>> {
         check_source_root(config),
         check_index(config),
         check_sidecar(config),
+        check_transcription(config),
         check_embeddings_config(config),
         check_llm_endpoint(config),
     ])
@@ -143,6 +144,26 @@ fn check_sidecar(config: &Config) -> Check {
             "ocr sidecar",
             format!("{e:#}"),
             "PDF/image extraction will fail; check permissions on the index directory",
+        ),
+    }
+}
+
+fn check_transcription(config: &Config) -> Check {
+    if !config.transcription.enabled {
+        return Check::ok("transcription", "disabled — media files stay pending");
+    }
+    match std::process::Command::new("ffmpeg").arg("-version").output() {
+        Ok(out) if out.status.success() => Check::ok(
+            "transcription",
+            format!(
+                "ffmpeg present; whisper model {} downloads on first media scan",
+                config.transcription.whisper_model
+            ),
+        ),
+        _ => Check::warn(
+            "transcription",
+            "ffmpeg not found — audio/video files will error",
+            "brew install ffmpeg, or set [transcription] enabled = false",
         ),
     }
 }

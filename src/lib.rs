@@ -15,6 +15,7 @@ pub mod ingest;
 pub mod llm;
 pub mod mcp;
 pub mod paths;
+pub mod research;
 pub mod retrieve;
 pub mod scan;
 pub mod service;

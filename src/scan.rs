@@ -374,16 +374,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_picks_up_pending_files_once_extractable() {
+    fn plan_retries_pending_files() {
+        // Every kind now has an extractor, so pending files (e.g. media
+        // recorded while transcription was disabled) retry each scan.
         let mut states = HashMap::new();
         states.insert("doc.txt".to_string(), state(5, 100, "pending"));
         states.insert("talk.mp3".to_string(), state(5, 100, "pending"));
         let mut audio = scanned("talk.mp3", 5, 100);
         audio.kind = FileKind::Audio;
         let p = plan(vec![scanned("doc.txt", 5, 100), audio], &states);
-        let rels: Vec<&str> = p.to_index.iter().map(|f| f.rel_path.as_str()).collect();
-        // txt has an extractor; audio still waits for its phase.
-        assert_eq!(rels, vec!["doc.txt"]);
-        assert_eq!(p.unchanged, 1);
+        assert_eq!(p.to_index.len(), 2);
+        assert_eq!(p.unchanged, 0);
     }
 }

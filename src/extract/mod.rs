@@ -12,6 +12,7 @@ use anyhow::Result;
 use crate::sidecar::Sidecar;
 
 pub mod image;
+pub mod media;
 pub mod pdf;
 pub mod text;
 
@@ -59,12 +60,17 @@ impl FileKind {
     /// Whether an extractor exists in this build. Kinds without one are
     /// recorded as `pending` and picked up when their phase ships.
     pub fn extractable(self) -> bool {
-        !matches!(self, FileKind::Audio | FileKind::Video)
+        true
     }
 
     /// Whether extraction goes through the OCR sidecar.
     pub fn needs_sidecar(self) -> bool {
         matches!(self, FileKind::Pdf | FileKind::Image)
+    }
+
+    /// Whether extraction needs the whisper transcriber.
+    pub fn needs_transcriber(self) -> bool {
+        matches!(self, FileKind::Audio | FileKind::Video)
     }
 }
 
@@ -77,9 +83,16 @@ pub struct ExtractedDoc {
     pub pages: Vec<String>,
 }
 
-/// Extract text from `path` according to its kind. `sidecar` is required
-/// for kinds where `needs_sidecar()` is true.
-pub fn extract(path: &Path, kind: FileKind, sidecar: Option<&Sidecar>) -> Result<ExtractedDoc> {
+/// The heavyweight helpers extraction may need, both optional so the
+/// text family works with neither.
+#[derive(Default)]
+pub struct Extractors<'a> {
+    pub sidecar: Option<&'a Sidecar>,
+    pub transcriber: Option<&'a media::Transcriber>,
+}
+
+/// Extract text from `path` according to its kind.
+pub fn extract(path: &Path, kind: FileKind, ex: &Extractors<'_>) -> Result<ExtractedDoc> {
     let title = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -87,9 +100,14 @@ pub fn extract(path: &Path, kind: FileKind, sidecar: Option<&Sidecar>) -> Result
     let pages = match kind {
         FileKind::Text | FileKind::Markdown | FileKind::Csv => vec![text::read_plain(path)?],
         FileKind::Html => vec![text::read_html(path)?],
-        FileKind::Pdf => pdf::extract_pdf(require_sidecar(sidecar)?, path)?,
-        FileKind::Image => image::extract_image(require_sidecar(sidecar)?, path)?,
-        other => anyhow::bail!("no extractor for {} files yet", other.as_str()),
+        FileKind::Pdf => pdf::extract_pdf(require_sidecar(ex.sidecar)?, path)?,
+        FileKind::Image => image::extract_image(require_sidecar(ex.sidecar)?, path)?,
+        FileKind::Audio | FileKind::Video => ex
+            .transcriber
+            .ok_or_else(|| anyhow::anyhow!(
+                "transcriber unavailable (transcription disabled or model failed to load)"
+            ))?
+            .transcribe(path)?,
     };
     Ok(ExtractedDoc { title, pages })
 }
@@ -111,12 +129,13 @@ mod tests {
     }
 
     #[test]
-    fn media_kinds_wait_for_their_phase() {
+    fn every_kind_is_extractable_and_helpers_are_flagged() {
         assert!(FileKind::Csv.extractable());
         assert!(FileKind::Pdf.extractable());
-        assert!(FileKind::Image.extractable());
-        assert!(!FileKind::Audio.extractable());
-        assert!(!FileKind::Video.extractable());
+        assert!(FileKind::Audio.extractable());
+        assert!(FileKind::Audio.needs_transcriber());
+        assert!(FileKind::Video.needs_transcriber());
+        assert!(!FileKind::Pdf.needs_transcriber());
     }
 
     #[test]
@@ -131,7 +150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("closing statement.txt");
         std::fs::write(&p, "sale price 487500").unwrap();
-        let doc = extract(&p, FileKind::Text, None).unwrap();
+        let doc = extract(&p, FileKind::Text, &Extractors::default()).unwrap();
         assert_eq!(doc.title.as_deref(), Some("closing statement"));
         assert_eq!(doc.pages, vec!["sale price 487500".to_string()]);
     }
@@ -141,7 +160,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.pdf");
         std::fs::write(&p, "%PDF").unwrap();
-        let err = extract(&p, FileKind::Pdf, None).unwrap_err().to_string();
+        let err = extract(&p, FileKind::Pdf, &Extractors::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("sidecar"), "{err}");
     }
 }

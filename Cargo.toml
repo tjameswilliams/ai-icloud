@@ -24,6 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "2", features = ["json"] }
 walkdir = "2"
+whisper-rs = { version = "0.16.0", features = ["metal"] }
 
 [dev-dependencies]
 assert_cmd = "2.2"

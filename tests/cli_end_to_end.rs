@@ -43,6 +43,9 @@ exclude_globs = ["Private/**"]
 [embeddings]
 provider = "debug-hash"
 
+[transcription]
+enabled = false
+
 [index]
 database_path = "{}"
 
@@ -136,8 +139,10 @@ fn rescan_is_incremental_and_deletion_prunes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("0 indexed"))
-        // Two indexed text files plus the still-pending mp3.
-        .stdout(predicate::str::contains("3 unchanged"));
+        // The two text files are unchanged; the mp3 retries while
+        // transcription is disabled and stays pending.
+        .stdout(predicate::str::contains("1 pending"))
+        .stdout(predicate::str::contains("2 unchanged"));
 
     std::fs::remove_file(fx.tree.join("groceries.md")).unwrap();
     cmd(&fx)

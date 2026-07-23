@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::chunk;
 use crate::config::Config;
 use crate::embed::Embedder;
-use crate::extract;
+use crate::extract::{self, Extractors};
 use crate::index::{FileStatus, IndexDb};
 use crate::scan::{ScanPlan, ScannedFile};
 use crate::sidecar::Sidecar;
@@ -68,9 +68,9 @@ pub fn ingest(db: &mut IndexDb, config: &Config, plan: ScanPlan, now_ms: i64) ->
         }
     }
 
-    // The OCR sidecar is only materialized when this run needs it; if it
-    // cannot start, PDF/image files land in `error` state and retry on the
-    // next scan.
+    // Heavyweight helpers are only brought up when this run needs them;
+    // if one cannot start, its files land in `error` state and retry on
+    // the next scan.
     let sidecar = if plan
         .to_index
         .iter()
@@ -89,9 +89,32 @@ pub fn ingest(db: &mut IndexDb, config: &Config, plan: ScanPlan, now_ms: i64) ->
     } else {
         None
     };
+    let transcriber = if config.transcription.enabled
+        && plan
+            .to_index
+            .iter()
+            .any(|f| !f.evicted && f.kind.needs_transcriber())
+    {
+        match config
+            .index_dir()
+            .and_then(|dir| extract::media::Transcriber::load(config, &dir.join("models")))
+        {
+            Ok(t) => Some(t),
+            Err(err) => {
+                tracing::warn!("transcriber unavailable: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let extractors = Extractors {
+        sidecar: sidecar.as_ref(),
+        transcriber: transcriber.as_ref(),
+    };
 
     for file in &plan.to_index {
-        match ingest_one(db, config, file, sidecar.as_ref(), now_ms) {
+        match ingest_one(db, config, file, &extractors, now_ms) {
             Ok(status) => match status {
                 FileStatus::Indexed => report.indexed += 1,
                 FileStatus::Pending => report.pending += 1,
@@ -112,7 +135,7 @@ fn ingest_one(
     db: &mut IndexDb,
     config: &Config,
     file: &ScannedFile,
-    sidecar: Option<&Sidecar>,
+    extractors: &Extractors<'_>,
     now_ms: i64,
 ) -> Result<FileStatus> {
     let kind = file.kind.as_str();
@@ -145,7 +168,8 @@ fn ingest_one(
         return Ok(FileStatus::Evicted);
     }
 
-    if !file.kind.extractable() {
+    // Media stays pending when transcription is switched off.
+    if file.kind.needs_transcriber() && !config.transcription.enabled {
         db.upsert_unextracted_file(
             &file.rel_path,
             kind,
@@ -157,7 +181,7 @@ fn ingest_one(
         return Ok(FileStatus::Pending);
     }
 
-    let extracted = match extract::extract(&file.abs_path, file.kind, sidecar) {
+    let extracted = match extract::extract(&file.abs_path, file.kind, extractors) {
         Ok(doc) => doc,
         Err(err) => {
             tracing::warn!("extraction failed for {}: {err:#}", file.rel_path);
@@ -304,7 +328,19 @@ pub fn reindex_path(db: &mut IndexDb, config: &Config, rel_path: &str) -> Result
     } else {
         None
     };
-    let status = ingest_one(db, config, &file, sidecar.as_ref(), now_ms)?;
+    let transcriber = if kind.needs_transcriber() && config.transcription.enabled {
+        Some(extract::media::Transcriber::load(
+            config,
+            &config.index_dir()?.join("models"),
+        )?)
+    } else {
+        None
+    };
+    let extractors = Extractors {
+        sidecar: sidecar.as_ref(),
+        transcriber: transcriber.as_ref(),
+    };
+    let status = ingest_one(db, config, &file, &extractors, now_ms)?;
     db.prune_orphan_embeddings()?;
 
     let mut embedded = 0;
@@ -354,6 +390,8 @@ mod tests {
         let db = IndexDb::open(&dbdir.path().join("index.sqlite")).unwrap();
         let mut config = Config::default();
         config.embeddings.provider = "debug-hash".into();
+        // Tests must never trigger the whisper model download.
+        config.transcription.enabled = false;
         (tree, dbdir, db, config)
     }
 

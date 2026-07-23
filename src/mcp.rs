@@ -104,6 +104,7 @@ impl McpServer {
             "search_facts" => self.tool_search_facts(&args),
             "sync_status" => self.tool_sync_status(),
             "reindex_file" => self.tool_reindex_file(&args),
+            "ask" => self.tool_ask(&args),
             other => return rpc_error(id, -32602, &format!("unknown tool: {other}")),
         };
         // Tool execution failures are results with isError, not protocol
@@ -374,6 +375,23 @@ impl McpServer {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("'rel_path' (non-empty string) is required"))?;
         ingest::reindex_path(&mut self.index, &self.config, rel_path)
+    }
+
+    fn tool_ask(&mut self, args: &Value) -> Result<String> {
+        let question = args
+            .get("question")
+            .and_then(Value::as_str)
+            .filter(|q| !q.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("'question' (non-empty string) is required"))?;
+        // Materialize the embedder first so the borrow of self splits
+        // cleanly between the index (shared) and the embedder (mutable).
+        let _ = self.embedder()?;
+        crate::research::ask(
+            &self.index,
+            &self.config,
+            self.embedder.as_mut(),
+            question,
+        )
     }
 
     fn resolve_document(&self, args: &Value) -> Result<DocumentInfo> {
@@ -650,6 +668,22 @@ fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "ask",
+            "description": "Server-side research: the LOCAL model iteratively \
+                searches the index, reads documents, and returns a synthesized \
+                answer citing file paths. Slower than search_documents and \
+                capped by the local model's ability — prefer searching and \
+                reasoning yourself when you can; use ask for one-shot factual \
+                lookups.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question to research" }
+                },
+                "required": ["question"]
+            }
+        },
+        {
             "name": "reindex_file",
             "description": "Force one file to re-extract, re-chunk, and \
                 re-embed now (e.g. after it changed or previously errored).",
@@ -766,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_names_all_seven_tools() {
+    fn tools_list_names_all_tools() {
         let (_d, mut s) = server();
         let resp = s
             .handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
@@ -786,6 +820,7 @@ mod tests {
                 "list_documents",
                 "search_facts",
                 "sync_status",
+                "ask",
                 "reindex_file"
             ]
         );
