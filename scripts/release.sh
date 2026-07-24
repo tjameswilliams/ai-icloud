@@ -19,6 +19,19 @@
 # Build-time requirement: the Xcode Command Line Tools (swiftc compiles
 # the embedded Vision OCR sidecar). End users of the released binary do
 # not need them.
+#
+# PRODUCTION PATH RULE: all distribution — including this machine — goes
+# through this script and the Homebrew tap. The daemon and every MCP
+# registration must point at the brew binary
+# (/opt/homebrew/bin/ai-icloud), never at target/release or ad-hoc
+# copies: only the Developer ID-signed brew binary keeps its TCC grant
+# across upgrades. Ship a change with:
+#   1. bump version in Cargo.toml, commit, tag vX.Y.Z, push
+#   2. gh release create vX.Y.Z
+#   3. scripts/release.sh X.Y.Z
+#   4. update Formula/ai-icloud.rb in tjameswilliams/homebrew-tap
+#      (url + sha256 printed below)
+#   5. brew upgrade ai-icloud   (daemon picks it up on next service start)
 set -euo pipefail
 
 VERSION="${1:?usage: release.sh <version> [--identity ID] [--notary-profile NAME] [--no-upload]}"

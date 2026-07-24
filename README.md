@@ -216,6 +216,15 @@ Building needs the Xcode Command Line Tools: `build.rs` compiles the Swift
 Vision-OCR sidecar and embeds it in the binary. Architecture notes live in
 [SPEC.md](SPEC.md).
 
+**Production path rule:** everything user-facing — the launchd daemon and
+all MCP registrations, including on the development machine — runs the
+Homebrew-installed binary (`/opt/homebrew/bin/ai-icloud`), never
+`target/release`. macOS anchors the iCloud-Drive/Full Disk Access grant to
+the code-signing identity; only the Developer ID-signed brew binary keeps
+that grant across upgrades. Releases flow: bump version → tag →
+`gh release create` → `scripts/release.sh` → update the tap formula →
+`brew upgrade`. Local builds are for `cargo test` and manual CLI runs only.
+
 ## License
 
 Dual-licensed under either of
