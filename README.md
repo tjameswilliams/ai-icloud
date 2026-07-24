@@ -204,6 +204,10 @@ the local model searches, reads, and answers with cited file paths.
 
 ## How indexing works
 
+<p align="center">
+  <img src="assets/pipeline.jpg" alt="ai-icloud pipeline: add a document on iPhone/iPad/web → iCloud Drive sync → watch daemon (FSEvents + debounce) → scan & diff (dataless files auto-download) → extract (PDF text, Vision OCR, Whisper) → local LLM enrichment (summary, facts, tags) → SQLite index (chunks, FTS5, vectors) → MCP server (stdio, HTTP, tailnet) → your agent" width="560">
+</p>
+
 1. **Scan** walks the tree (exclusion globs, extension scoping, size caps),
    detects iCloud eviction stubs (`.name.icloud`) and asks `brctl` to
    materialize them, and diffs size/mtime/sha256 against the index.
