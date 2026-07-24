@@ -24,10 +24,12 @@ the same architecture over Apple Messages.
 - macOS (Apple Vision OCR, PDFKit, FSEvents, launchd)
 - Rust + Xcode Command Line Tools (`swiftc` builds the OCR sidecar at compile
   time; end users of a prebuilt binary don't need it)
-- An OpenAI-compatible LLM server on loopback for enrichment and the `ask`
-  tool — LM Studio by default (`http://127.0.0.1:1234/v1`); Ollama or anything
-  else works via config
-- `ffmpeg` for audio/video transcription (`brew install ffmpeg`), optional
+- An OpenAI-compatible LLM server for enrichment and the `ask` tool — any
+  provider works (LM Studio is the macOS happy path at
+  `http://127.0.0.1:1234/v1`; Ollama, llama.cpp, vLLM, or hosted providers
+  drop in via config; remote endpoints are an explicit privacy opt-in)
+- `ffmpeg` for audio/video transcription (installed automatically by the
+  brew formula; `brew install ffmpeg` for source builds)
 
 ## Install
 
@@ -48,13 +50,16 @@ The wizard walks through everything the two-pass design needs:
 1. **What to index** — confirms the iCloud Drive folder is readable and
    counts the in-scope files.
 2. **LLM backend** — ai-icloud extracts text locally (pass one) and then
-   has a local model interpret every document (pass two: summary, type,
-   facts, tags). The wizard probes your OpenAI-compatible endpoint,
-   walks the LM Studio happy path (install → Developer tab → Start
-   Server → API token), lists the server's models, recommends
-   `google/gemma-4-12b-qat` (multimodal, so one model covers text and
-   page-image passes), and verifies the model answers before moving on.
-   Ollama or any other OpenAI-compatible server drops in the same way.
+   has a model interpret every document (pass two: summary, type, facts,
+   tags). Any OpenAI-compatible inference server works — LM Studio,
+   Ollama, llama.cpp, vLLM, or a hosted provider (sending content
+   off-machine is an explicit opt-in the wizard asks about). The wizard
+   probes the endpoint, walks the LM Studio happy path on macOS
+   (install → Developer tab → Start Server → API token), lists the
+   server's models, and verifies your pick answers before moving on. On
+   Apple Silicon with 32 GB+ RAM it suggests a `gemma-4-12b` variant
+   (multimodal, so one model covers text and page-image passes) — a
+   suggestion, not a requirement; pick whatever your hardware runs well.
 3. **Privacy boundary** — exclusion globs; excluded folders are never
    read and never enter the database.
 4. **Transcription** — opt in/out of local whisper for audio/video.

@@ -104,6 +104,8 @@ Formula stanza for the tap (binary install on this architecture):
     sha256 "${SHA}"
     version "${VERSION}"
 
+    depends_on "ffmpeg"
+
     def install
       bin.install "ai-icloud"
     end
@@ -112,8 +114,9 @@ Formula stanza for the tap (binary install on this architecture):
       <<~EOS
         Start with the interactive wizard:
           ai-icloud setup
-        It walks through the OpenAI-compatible LLM backend (LM Studio is
-        the happy path), privacy exclusions, and transcription, then:
+        It walks through your OpenAI-compatible LLM backend (any provider
+        works; LM Studio is the macOS happy path), privacy exclusions,
+        and transcription, then:
           ai-icloud scan
           ai-icloud service install
           ai-icloud connect   # MCP JSON for any agent framework

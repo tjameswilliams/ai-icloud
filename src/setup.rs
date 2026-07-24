@@ -13,9 +13,11 @@ use anyhow::{Context, Result};
 
 use crate::config::{Config, LoadedConfig};
 
-/// Model preferred when present: multimodal (one model covers text and
-/// vision passes), fast, and strong enough for structured extraction.
-const RECOMMENDED_MODEL: &str = "google/gemma-4-12b-qat";
+/// Suggested (never required) on Apple Silicon with 32 GB+ RAM:
+/// multimodal (one model covers text and vision passes), fast, and
+/// strong enough for structured extraction. Any instruction-tuned model
+/// on any OpenAI-compatible server works.
+const SUGGESTED_MODEL_FRAGMENT: &str = "gemma-4-12b";
 
 pub fn run_setup(loaded: &LoadedConfig) -> Result<()> {
     let mut config = loaded.config.clone();
@@ -63,18 +65,38 @@ fn step_source_root(config: &mut Config, input: &mut impl BufRead) -> Result<()>
 }
 
 fn step_llm_backend(config: &mut Config, input: &mut impl BufRead) -> Result<()> {
-    println!("Step 2/4 — LLM backend (OpenAI-compatible; used to summarize and");
-    println!("extract facts from every document, and for the `ask` tool)\n");
-    println!("Happy path: LM Studio (https://lmstudio.ai)");
-    println!("  1. Install LM Studio and download a model");
-    println!("     (recommended: {RECOMMENDED_MODEL} — multimodal, fast)");
+    println!("Step 2/4 — LLM backend (used to summarize and extract facts from");
+    println!("every document, and for the `ask` tool)\n");
+    println!("Any OpenAI-compatible inference server works: LM Studio, Ollama,");
+    println!("llama.cpp, vLLM, or a hosted provider — point the base URL at");
+    println!("whichever serves you best.\n");
+    println!("Happy path on macOS: LM Studio (https://lmstudio.ai)");
+    println!("  1. Install LM Studio and download a model in its UI");
     println!("  2. Open the Developer tab → Start Server (default port 1234)");
-    println!("  3. If the server requires an API token, copy it from the same tab");
-    println!("Ollama and any other OpenAI-compatible server work the same way.\n");
+    println!("  3. If the server requires an API token, copy it from the same tab\n");
 
     loop {
         let base_url = prompt(input, "LLM base URL", &config.llm.base_url)?;
         config.llm.base_url = base_url.trim_end_matches('/').to_string();
+
+        // A remote provider is a legitimate choice, but sending document
+        // content off-machine is opt-in, never a side effect.
+        if !crate::embed::is_loopback_url(&config.llm.base_url)
+            && !config.privacy.allow_remote_endpoints
+        {
+            println!(
+                "  ! {} is not on this machine — enrichment sends document \
+                 content there",
+                config.llm.base_url
+            );
+            if ask_yes_no(input, "  Allow sending document content to this remote endpoint?", false)?
+            {
+                config.privacy.allow_remote_endpoints = true;
+            } else {
+                println!("  keeping loopback-only; enter a local URL instead\n");
+                continue;
+            }
+        }
 
         match probe_models(&config.llm.base_url, config.llm.api_key.as_deref()) {
             Ok(models) => {
@@ -115,7 +137,12 @@ fn step_pick_models(
     input: &mut impl BufRead,
     models: &[String],
 ) -> Result<()> {
-    if !models.is_empty() {
+    if models.is_empty() {
+        println!(
+            "  ! the server lists no models yet — download/load one in your \
+             server's UI (LM Studio: the search tab), then set [llm] model later"
+        );
+    } else {
         println!("  available models:");
         for m in models.iter().take(15) {
             println!("    - {m}");
@@ -124,7 +151,21 @@ fn step_pick_models(
             println!("    … and {} more", models.len() - 15);
         }
     }
-    let default = recommend_model(models, &config.llm.model);
+    let capable = apple_silicon_32gb();
+    if capable {
+        println!(
+            "  suggestion for this machine (Apple Silicon, 32 GB+): a \
+             gemma-4-12b variant — multimodal, so one model covers text and \
+             vision passes. Any instruction-tuned model works."
+        );
+    } else {
+        println!(
+            "  pick any instruction-tuned model your hardware runs well; \
+             a multimodal one lets a single model cover text and vision \
+             passes, otherwise set a separate vision model."
+        );
+    }
+    let default = recommend_model(models, &config.llm.model, capable);
     let model = prompt(input, "enrichment model", &default)?;
     config.llm.model = model;
     let vision_default = if config.llm.vision_model.is_empty() {
@@ -141,13 +182,16 @@ fn step_pick_models(
     Ok(())
 }
 
-/// Existing choice wins if the server still has it; then the recommended
-/// model; then the first thing that is not an embedding model.
-fn recommend_model(models: &[String], existing: &str) -> String {
+/// Existing choice wins if the server still has it; on capable hardware
+/// a gemma-4-12b variant is suggested when present; otherwise the first
+/// thing that is not an embedding model.
+fn recommend_model(models: &[String], existing: &str, capable_hardware: bool) -> String {
     if !existing.is_empty() && models.iter().any(|m| m == existing) {
         return existing.to_string();
     }
-    if let Some(m) = models.iter().find(|m| m.as_str() == RECOMMENDED_MODEL) {
+    if capable_hardware
+        && let Some(m) = models.iter().find(|m| m.contains(SUGGESTED_MODEL_FRAGMENT))
+    {
         return m.clone();
     }
     models
@@ -155,6 +199,20 @@ fn recommend_model(models: &[String], existing: &str) -> String {
         .find(|m| !m.contains("embed"))
         .cloned()
         .unwrap_or_else(|| existing.to_string())
+}
+
+/// Apple Silicon with 32 GB+ of unified memory — the tier where a 12B
+/// multimodal model is a comfortable suggestion.
+fn apple_silicon_32gb() -> bool {
+    if std::env::consts::ARCH != "aarch64" {
+        return false;
+    }
+    std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .is_some_and(|bytes| bytes >= 32 * 1024 * 1024 * 1024)
 }
 
 /// One tiny completion so a bad model id or a broken server surfaces now,
@@ -333,22 +391,32 @@ mod tests {
     }
 
     #[test]
-    fn recommend_prefers_existing_then_recommended_then_non_embedding() {
+    fn recommend_prefers_existing_then_suggestion_then_non_embedding() {
         let models = vec![
             "text-embedding-nomic-embed-text".to_string(),
             "google/gemma-4-12b-qat".to_string(),
             "qwen/qwen3.6-27b".to_string(),
         ];
         assert_eq!(
-            recommend_model(&models, "qwen/qwen3.6-27b"),
+            recommend_model(&models, "qwen/qwen3.6-27b", true),
             "qwen/qwen3.6-27b"
         );
-        assert_eq!(recommend_model(&models, ""), RECOMMENDED_MODEL);
-        assert_eq!(recommend_model(&models, "gone-model"), RECOMMENDED_MODEL);
+        assert_eq!(recommend_model(&models, "", true), "google/gemma-4-12b-qat");
+        assert_eq!(
+            recommend_model(&models, "gone-model", true),
+            "google/gemma-4-12b-qat"
+        );
+        // The gemma suggestion is hardware-gated; smaller machines get
+        // the first non-embedding model instead.
+        assert_eq!(
+            recommend_model(&models, "", false),
+            "google/gemma-4-12b-qat" // still first non-embedding here
+        );
         let no_gemma = vec![
             "text-embedding-nomic-embed-text".to_string(),
             "llama3.2".to_string(),
         ];
-        assert_eq!(recommend_model(&no_gemma, ""), "llama3.2");
+        assert_eq!(recommend_model(&no_gemma, "", true), "llama3.2");
+        assert_eq!(recommend_model(&no_gemma, "", false), "llama3.2");
     }
 }
