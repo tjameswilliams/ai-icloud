@@ -21,4 +21,5 @@ pub mod scan;
 pub mod service;
 pub mod setup;
 pub mod sidecar;
+pub mod tailnet;
 pub mod watch;

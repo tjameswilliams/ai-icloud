@@ -260,11 +260,28 @@ fn run_connect(loaded: &LoadedConfig, token_only: bool) -> Result<()> {
             println!("MCP over HTTP — served persistently at http://{addr}/mcp:");
             println!("(check it is running: ai-icloud service status)\n");
             println!("{}\n", serde_json::to_string_pretty(&http)?);
-            println!(
-                "For access beyond this machine, front the loopback server with a \
-                 private proxy (e.g. `tailscale serve --bg --https=8443 \
-                 http://{addr}`) and swap the URL accordingly.\n"
-            );
+
+            match crate::tailnet::mcp_url_for(&addr) {
+                Some(url) => {
+                    let tailnet = serde_json::json!({
+                        "mcpServers": {
+                            "ai-icloud": {
+                                "url": url,
+                                "headers": { "Authorization": format!("Bearer {token}") }
+                            }
+                        }
+                    });
+                    println!("MCP over your tailnet — for phones and other tailnet devices:\n");
+                    println!("{}\n", serde_json::to_string_pretty(&tailnet)?);
+                }
+                None => println!(
+                    "For access beyond this machine, front the loopback server \
+                     with a private proxy (e.g. `tailscale serve --bg \
+                     --https=8443 http://{addr}`), then re-run `ai-icloud \
+                     connect` — the tailnet URL will be detected and printed \
+                     as ready-to-paste JSON.\n"
+                ),
+            }
             println!("bearer token: {token}");
         }
         None => {
