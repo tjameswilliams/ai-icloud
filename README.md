@@ -116,6 +116,41 @@ allow_remote_endpoints = false   # loopback-only for llm + embeddings
 | `connect` | print (or mint) the HTTP bearer token |
 | `doctor` | actionable environment checks |
 
+## Using from MCP clients
+
+`ai-icloud connect` prints all of this ready-to-paste for your install.
+
+### Claude Code
+
+```bash
+claude mcp add --scope user ai-icloud -- "$(which ai-icloud)" serve
+```
+
+### Claude Desktop / LM Studio / Codex / other stdio clients
+
+Add to the client's MCP config (`claude_desktop_config.json`, LM Studio's
+`mcp.json`, `~/.codex/config.toml`'s equivalent, …):
+
+```json
+{
+  "mcpServers": {
+    "ai-icloud": { "command": "/opt/homebrew/bin/ai-icloud", "args": ["serve"] }
+  }
+}
+```
+
+### HTTP clients (Open WebUI, remote/mobile)
+
+```bash
+ai-icloud service install --http     # persistent server on 127.0.0.1:8788
+ai-icloud connect                    # URL + bearer token as paste-ready JSON
+```
+
+The server binds loopback only. For phones or other machines, front it
+with a private proxy — e.g. `tailscale serve --bg --https=8443
+http://127.0.0.1:8788` — and keep the `Authorization: Bearer <token>`
+header; the token guards your documents.
+
 ## MCP tools
 
 `search_documents`, `get_document` (paged full text + facts + tags),
@@ -145,6 +180,21 @@ stream settles, and re-runs the (cheap) scan diff; a periodic tick reconciles
 anything FSEvents dropped. Every stage is per-file/per-doc transactional, so
 a crash or restart resumes cleanly.
 
+## Privacy
+
+- Everything — OCR, transcription, enrichment, embeddings, search — runs on
+  your machine. Document content is only ever sent to loopback endpoints;
+  a non-loopback `base_url` is refused unless you set
+  `[privacy] allow_remote_endpoints = true`.
+- `exclude_globs` folders are never read and never enter the database.
+  Decide before the first scan: anything indexed is readable by every
+  MCP client you connect.
+- The index lives at `~/Library/Application Support/ai-icloud/` with
+  owner-only permissions (0700 dir, 0600 database and tokens).
+- Logs contain file paths and counts, never document content.
+- To erase everything: `ai-icloud service uninstall && rm -rf
+  ~/Library/Application\ Support/ai-icloud`.
+
 ## Full Disk Access
 
 launchd runs the binary directly, so if the daemon logs permission errors on
@@ -152,6 +202,25 @@ launchd runs the binary directly, so if the daemon logs permission errors on
 (System Settings → Privacy & Security → Full Disk Access). Rebuilding an
 unsigned binary invalidates the grant — codesign release builds.
 
+## Development
+
+```bash
+cargo test          # 140+ tests; offline via the debug-hash embedder,
+                    # synthetic fixture trees, no real user data
+cargo clippy --all-targets
+scripts/release.sh <version>   # codesigned (optionally notarized) release
+                               # + Homebrew formula stanza
+```
+
+Building needs the Xcode Command Line Tools: `build.rs` compiles the Swift
+Vision-OCR sidecar and embeds it in the binary. Architecture notes live in
+[SPEC.md](SPEC.md).
+
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
