@@ -1,5 +1,7 @@
 # ai-icloud
 
+![ai-icloud — local-first iCloud Drive document search for AI agents](assets/header.jpg)
+
 Local-first RAG index and MCP server for your iCloud Drive documents.
 
 A background daemon watches `~/Library/Mobile Documents/com~apple~CloudDocs`,
