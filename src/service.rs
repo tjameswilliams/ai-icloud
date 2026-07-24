@@ -262,6 +262,21 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// The `--http ADDR` baked into the installed serve agent, if any.
+pub fn installed_http_addr() -> Result<Option<String>> {
+    let plist = plist_path_for(SERVE_LABEL)?;
+    let Ok(content) = fs::read_to_string(&plist) else {
+        return Ok(None);
+    };
+    Ok(parse_http_addr(&content))
+}
+
+fn parse_http_addr(plist: &str) -> Option<String> {
+    let after = plist.split("<string>--http</string>").nth(1)?;
+    let addr = after.split("<string>").nth(1)?.split("</string>").next()?;
+    Some(addr.trim().to_string())
+}
+
 /// Report install + running state of both agents.
 pub fn status(loaded: &LoadedConfig) -> Result<()> {
     let uid = uid()?;
@@ -306,6 +321,19 @@ mod tests {
         assert!(plist.contains("cfg &amp; special.toml"));
         assert!(plist.contains("<string>watch</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn http_addr_parses_out_of_the_plist() {
+        let plist = build_plist(
+            SERVE_LABEL,
+            Path::new("/bin/ai-icloud"),
+            None,
+            &["serve", "--http", "127.0.0.1:9999"],
+            Path::new("/tmp/serve.log"),
+        );
+        assert_eq!(parse_http_addr(&plist), Some("127.0.0.1:9999".to_string()));
+        assert_eq!(parse_http_addr("<plist/>"), None);
     }
 
     #[test]

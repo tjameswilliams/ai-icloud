@@ -35,6 +35,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Interactive onboarding: source folder, LLM backend (LM Studio happy
+    /// path), privacy exclusions, transcription — writes config.toml
+    Setup,
     /// Check the environment: source tree, index, endpoints
     Doctor,
     /// Scan the source tree and index new or changed files
@@ -91,8 +94,12 @@ enum Command {
         #[arg(long, value_name = "ADDR")]
         http: Option<String>,
     },
-    /// Print the HTTP bearer token (generating it on first use)
-    Connect,
+    /// Print copy-pasteable MCP client JSON (stdio and HTTP forms)
+    Connect {
+        /// Print only the HTTP bearer token
+        #[arg(long)]
+        token_only: bool,
+    },
     /// Show or locate the configuration
     Config {
         #[command(subcommand)]
@@ -136,6 +143,7 @@ pub fn run() -> Result<()> {
     let loaded = config::load(cli.config.as_deref())?;
 
     match cli.command {
+        Command::Setup => crate::setup::run_setup(&loaded),
         Command::Doctor => run_doctor(&loaded),
         Command::Scan {
             dry_run,
@@ -164,10 +172,7 @@ pub fn run() -> Result<()> {
             ServiceAction::Status => crate::service::status(&loaded),
         },
         Command::Serve { http } => run_serve(&loaded, http.as_deref()),
-        Command::Connect => {
-            println!("{}", load_or_create_http_token(&loaded.config)?);
-            Ok(())
-        }
+        Command::Connect { token_only } => run_connect(&loaded, token_only),
         Command::Config { action } => run_config(&loaded, action),
     }
 }
@@ -213,6 +218,64 @@ fn run_serve(loaded: &LoadedConfig, http: Option<&str>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Setup's "run the first scan now" hook.
+pub fn first_scan(loaded: &LoadedConfig) -> Result<()> {
+    run_scan(loaded, false, false, false, false)
+}
+
+/// Ready-to-paste MCP client JSON for any agentic framework, in every
+/// form this install supports.
+fn run_connect(loaded: &LoadedConfig, token_only: bool) -> Result<()> {
+    if token_only {
+        println!("{}", load_or_create_http_token(&loaded.config)?);
+        return Ok(());
+    }
+
+    let binary = std::env::current_exe().context("could not determine the binary's own path")?;
+    let stdio = serde_json::json!({
+        "mcpServers": {
+            "ai-icloud": { "command": binary, "args": ["serve"] }
+        }
+    });
+    println!("MCP over stdio — Claude Desktop, Claude Code, LM Studio, Codex, …:\n");
+    println!("{}\n", serde_json::to_string_pretty(&stdio)?);
+    println!(
+        "Claude Code one-liner:\n  claude mcp add --scope user ai-icloud -- {} serve\n",
+        binary.display()
+    );
+
+    match crate::service::installed_http_addr()? {
+        Some(addr) => {
+            let token = load_or_create_http_token(&loaded.config)?;
+            let http = serde_json::json!({
+                "mcpServers": {
+                    "ai-icloud": {
+                        "url": format!("http://{addr}/mcp"),
+                        "headers": { "Authorization": format!("Bearer {token}") }
+                    }
+                }
+            });
+            println!("MCP over HTTP — served persistently at http://{addr}/mcp:");
+            println!("(check it is running: ai-icloud service status)\n");
+            println!("{}\n", serde_json::to_string_pretty(&http)?);
+            println!(
+                "For access beyond this machine, front the loopback server with a \
+                 private proxy (e.g. `tailscale serve --bg --https=8443 \
+                 http://{addr}`) and swap the URL accordingly.\n"
+            );
+            println!("bearer token: {token}");
+        }
+        None => {
+            println!(
+                "MCP over HTTP: not enabled. Opt in with\n  \
+                 ai-icloud service install --http\nthen re-run `ai-icloud connect` \
+                 for the URL, token, and JSON."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The HTTP bearer token: from config if set, else generated once from

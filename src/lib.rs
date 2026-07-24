@@ -19,5 +19,6 @@ pub mod research;
 pub mod retrieve;
 pub mod scan;
 pub mod service;
+pub mod setup;
 pub mod sidecar;
 pub mod watch;

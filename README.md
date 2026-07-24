@@ -27,32 +27,52 @@ the same architecture over Apple Messages.
   else works via config
 - `ffmpeg` for audio/video transcription (`brew install ffmpeg`), optional
 
-## Quick start
+## Install
 
 ```bash
+brew install tjameswilliams/tap/ai-icloud   # prebuilt, codesigned binary
+# or from source (needs Rust + Xcode CLT):
 cargo build --release
-
-# What would be indexed?
-./target/release/ai-icloud scan --dry-run
-
-# Check the environment (iCloud access, index, OCR sidecar, LLM endpoint)
-./target/release/ai-icloud doctor
-
-# Index + enrich + embed
-./target/release/ai-icloud scan
-
-# Search from the CLI
-./target/release/ai-icloud search closing statement sale price
-
-# Register with Claude Code
-claude mcp add --scope user ai-icloud -- $PWD/target/release/ai-icloud serve
-
-# Install the launchd watch daemon (indexes changes continuously)
-./target/release/ai-icloud service install
 ```
+
+## Onboarding
+
+```bash
+ai-icloud setup
+```
+
+The wizard walks through everything the two-pass design needs:
+
+1. **What to index** — confirms the iCloud Drive folder is readable and
+   counts the in-scope files.
+2. **LLM backend** — ai-icloud extracts text locally (pass one) and then
+   has a local model interpret every document (pass two: summary, type,
+   facts, tags). The wizard probes your OpenAI-compatible endpoint,
+   walks the LM Studio happy path (install → Developer tab → Start
+   Server → API token), lists the server's models, recommends
+   `google/gemma-4-12b-qat` (multimodal, so one model covers text and
+   page-image passes), and verifies the model answers before moving on.
+   Ollama or any other OpenAI-compatible server drops in the same way.
+3. **Privacy boundary** — exclusion globs; excluded folders are never
+   read and never enter the database.
+4. **Transcription** — opt in/out of local whisper for audio/video.
+
+Then:
+
+```bash
+ai-icloud scan             # index + enrich + embed (first run downloads models)
+ai-icloud service install  # background daemon: indexes changes continuously
+ai-icloud connect          # copy-pasteable MCP JSON for any agent framework
+```
+
+`connect` prints ready-to-paste client config for every form this install
+supports — stdio for Claude Desktop/Claude Code/Codex/LM Studio, a Claude
+Code one-liner, and (after `service install --http`) the HTTP URL +
+bearer-token JSON for frameworks that speak streamable HTTP.
 
 First scan downloads the embedding model (~130 MB); the first media file
 downloads the whisper model (~1.6 GB). Both land under the index directory.
+`ai-icloud doctor` diagnoses anything that goes sideways.
 
 ## Configuration
 
