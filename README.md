@@ -2,19 +2,55 @@
 
 ![ai-icloud — local-first iCloud Drive document search for AI agents](assets/header.jpg)
 
-Local-first RAG index and MCP server for your iCloud Drive documents.
+**Siri can't tell you what's in your iCloud Drive. And you don't want to
+upload your closing statements, insurance policies, and tax documents to
+ChatGPT to get answers about them.**
+
+ai-icloud is the private, native way to put an AI agent on top of your
+documents. It runs entirely on your Mac, reads everything in your iCloud
+Drive — scanned PDFs, photos of receipts, saved emails, even voice memos —
+and serves it to any AI agent you already use, over MCP. Nothing leaves
+your machine.
+
+## The digital filing cabinet, but it answers questions
+
+Think of everything you would have put in a filing cabinet ten years ago:
+closing statements, insurance policies, tax forms, tickets, legal
+documents, warranties, that one important email you printed to PDF. Today
+it's scattered across iCloud Drive — and when a question comes up, you're
+back to digging through folders, squinting at scans.
+
+Now you just ask your agent:
+
+> **"Hey, when does my auto insurance renew?"**
+
+It searches the index, finds the policy documents, reads the renewal date
+out of the extracted facts, and answers with the exact figure *and* the
+file that proves it — `Car/insurance.pdf`, page 1. Same for *"what were
+my net proceeds when I sold the house?"*, *"what's my policy number?"*,
+or *"find the parking pass for the games."* The answer comes with a
+citation, so the proof is one click away instead of one drawer down.
+
+## Why this exists
+
+This is almost certainly where Siri is headed — an assistant that
+actually knows your documents. Apple can't ship it yet: the privacy
+problem is brutal at mass-market scale, and most people don't own
+hardware that can run this stack. But if you have a capable Mac, you
+don't have to wait. Everything — OCR, transcription, document
+understanding, embeddings, search — runs locally. Document content only
+ever goes to loopback endpoints unless you explicitly opt in to a remote
+provider (`[privacy] allow_remote_endpoints`).
+
+## What it does
 
 A background daemon watches `~/Library/Mobile Documents/com~apple~CloudDocs`,
 extracts text from everything it finds — PDF text layers, Apple Vision OCR for
 scans and images, whisper.cpp transcription for audio/video — enriches each
 document with a local LLM (summary, type, key-value facts, tags), embeds
-everything into a SQLite index, and serves it to any MCP-capable agent. Ask
-your agent *"when I sold my house, what was my profit?"* and it finds the
-closing statement and reads the numbers out of the facts table.
-
-Everything runs on your machine. Document content only ever leaves the index
-toward loopback endpoints unless you explicitly flip
-`[privacy] allow_remote_endpoints`.
+everything into a SQLite index, and serves it to any MCP-capable agent:
+Claude, or anything else that speaks MCP, on your Mac or (via your private
+tailnet) your phone.
 
 Sister project: [ai-imessage](https://github.com/tjameswilliams/ai-imessage) —
 the same architecture over Apple Messages.
