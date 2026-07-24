@@ -189,13 +189,19 @@ pub fn scan_tree(root: &Path, source: &SourceConfig) -> Result<Vec<ScannedFile>>
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
+        // Modern iCloud eviction leaves no .icloud stub: the file stats
+        // normally but occupies zero blocks. Reading it would fail (or
+        // block), so route it through the eviction path, which asks for
+        // a download and retries once content lands.
+        let dataless = is_dataless(&meta);
+
         out.push(ScannedFile {
             rel_path: logical_rel,
             abs_path: entry.path().to_path_buf(),
             kind,
             size: meta.len() as i64,
             mtime_ms,
-            evicted,
+            evicted: evicted || dataless,
         });
     }
     // Deterministic order helps tests and makes progress output readable.
@@ -251,6 +257,19 @@ pub fn plan(scanned: Vec<ScannedFile>, states: &HashMap<String, FileState>) -> S
         plan.suspicious_removals = std::mem::take(&mut plan.to_remove);
     }
     plan
+}
+
+/// A non-empty file with zero allocated blocks has no local content —
+/// the APFS signature of a dataless (cloud-evicted) file.
+#[cfg(unix)]
+fn is_dataless(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.len() > 0 && meta.blocks() == 0
+}
+
+#[cfg(not(unix))]
+fn is_dataless(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn rel_path(root: &Path, path: &Path) -> String {
